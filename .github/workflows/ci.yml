@@ -1,0 +1,30 @@
+name: macOS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show toolchain
+        run: swift --version
+      - name: Install chezmoi
+        run: brew install chezmoi
+      - name: Test isolated sync and API requests
+        run: swift test --disable-sandbox
+      - name: Check shell syntax
+        run: bash -n scripts/build-app.sh scripts/build-icons.sh
+      - name: Build app and verify signature
+        run: |
+          bash scripts/build-app.sh
+          codesign --verify --strict "dist/Chezmoi Menu.app"
+          plutil -lint "dist/Chezmoi Menu.app/Contents/Info.plist"

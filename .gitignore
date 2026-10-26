@@ -1,0 +1,16 @@
+.build/
+dist/
+.DS_Store
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+*.app/
+.env
+.env.*
+*.pem
+*.key
+Backups/
+backups/
+*.log
+# Local validation notes may contain machine-specific paths. Public coverage is in docs/TESTING.md.
+/TEST-RESULTS.md
