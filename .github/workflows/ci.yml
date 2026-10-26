@@ -11,11 +11,9 @@ permissions:
 
 jobs:
   test-and-build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.os }}
+    runs-on: xcode-27
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,13 +24,14 @@ jobs:
       - name: Test isolated sync and API requests
         run: swift test --disable-sandbox
       - name: Check shell syntax
-        run: bash -n scripts/build-app.sh scripts/build-icons.sh scripts/package-release.sh
+        run: bash -n scripts/*.sh
       - name: Test notarization credential loading
         run: python3 -m unittest discover -s Tests/DistributionTests
       - name: Build app and verify signature
         run: |
-          bash scripts/build-app.sh --universal
-          architectures=" $(lipo -archs 'dist/Chezmoi Menu.app/Contents/MacOS/ChezmoiMenu') "
-          [[ "$architectures" == *" arm64 "* && "$architectures" == *" x86_64 "* ]]
+          bash scripts/build-app.sh
+          [[ "$(lipo -archs 'dist/Chezmoi Menu.app/Contents/MacOS/ChezmoiMenu')" == arm64 ]]
           codesign --verify --strict "dist/Chezmoi Menu.app"
           plutil -lint "dist/Chezmoi Menu.app/Contents/Info.plist"
+          test -f 'dist/Chezmoi Menu.app/Contents/Resources/Assets.car'
+          test -f 'dist/Chezmoi Menu.app/Contents/Resources/Metadata.appintents/extract.actionsdata'

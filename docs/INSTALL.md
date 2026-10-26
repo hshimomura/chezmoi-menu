@@ -1,10 +1,10 @@
 # 別の Mac へのインストール
 
-macOS 14 以降の Apple Silicon / Intel Mac で利用できます。Universal 版には両方の実行コードが含まれ、アプリのビルドや Rosetta は不要です。
+macOS 27 以降の Apple Silicon Mac で利用できます。arm64 専用で、アプリのビルドや Rosetta は不要です。0.2.0 から Intel と macOS 26 以前は対象外です。
 
 ## 1. アプリを配置する
 
-1. [GitHub Releases](https://github.com/hshimomura/chezmoi-menu/releases/latest) から `Chezmoi-Menu-<バージョン>-universal.zip` をダウンロードします。
+1. [GitHub Releases](https://github.com/hshimomura/chezmoi-menu/releases/latest) から `Chezmoi-Menu-<バージョン>-arm64.zip` をダウンロードします。
 2. ZIP を展開します。
 3. `Chezmoi Menu.app` を `~/Applications` または `/Applications` に移します。`~/Applications` がなければ Finder で作成できます。
 4. アプリを起動します。初回は設定画面が開き、メニューバーに家と鍵穴のマークが表示されます。
@@ -14,7 +14,7 @@ macOS 14 以降の Apple Silicon / Intel Mac で利用できます。Universal �
 ダウンロードの整合性を確認したい場合は、同じ Release の `.sha256` ファイルも ZIP と同じフォルダへ保存し、そのフォルダで実行します。
 
 ```sh
-shasum -a 256 -c Chezmoi-Menu-0.1.1-universal.zip.sha256
+shasum -a 256 -c Chezmoi-Menu-0.2.0-arm64.zip.sha256
 ```
 
 別バージョンではファイル名を読み替えます。
@@ -46,7 +46,7 @@ chezmoi diff
 
 ## 3. アプリを設定する
 
-- chezmoi の実行ファイルは、Apple Silicon の Homebrew なら通常 `/opt/homebrew/bin/chezmoi`、Intel なら `/usr/local/bin/chezmoi` です。通常は自動選択されます。
+- chezmoi の実行ファイルは通常 `/opt/homebrew/bin/chezmoi` です。既存の保存済みパスは保持します。
 - 独自の chezmoi 設定ファイルを使わない場合、設定ファイル欄は空欄にします。
 - AI 競合解決を使う場合は、その Mac の設定画面で OpenAI API key を保存します。
 - 必要なら「ログイン時に起動する」を有効にします。起動時に自動同期は行いません。
@@ -55,8 +55,8 @@ API key は各 Mac のキーチェーンに個別保存します。アプリ設�
 
 ## 4. 最初の同期
 
-1. 「同期前チェック（適用・送信なし）」を実行します。
-2. source / destination と差分を実行履歴で確認します。
+1. 「同期前チェック」を実行します。
+2. 「同期」画面で source / destination と件数を確認し、「差分」画面の「差分を更新」で内容を確認します。
 3. リモートから取り込みたい Mac では Download 同期を実行します。
 4. その Mac の編集を他へ送る場合は Upload 同期を実行します。
 
@@ -68,4 +68,4 @@ API key は各 Mac のキーチェーンに個別保存します。アプリ設�
 
 ## ソースからビルドする場合
 
-Swift 6 対応の開発ツールを用意し、リポジトリで `bash scripts/build-app.sh` を実行します。両アーキテクチャ用なら `bash scripts/build-app.sh --universal` を使用します。既定のローカルビルドは ad-hoc 署名です。[開発手順](DEVELOPMENT.md) を参照してください。
+macOS 27 と Xcode 27.1 以降を用意し、リポジトリで `bash scripts/build-app.sh` を実行します。arm64 専用で、既定のローカルビルドは ad-hoc 署名です。[開発手順](DEVELOPMENT.md) を参照してください。

@@ -7,7 +7,7 @@
 - 確認した upstream のコミット: `e5ae319347c3efa0acbc3d2ab2a01e5abf62b276`
 - ライセンス: [upstream の MIT License](https://github.com/twpayne/chezmoi/blob/e5ae319347c3efa0acbc3d2ab2a01e5abf62b276/LICENSE)
 
-`Assets/chezmoi-original.png` は chezmoi ロゴに由来する提供画像です。`AppIcon-master.png`、`AppIcon.png`、`AppIcon.icns` は、その図形を基に macOS 用に調整した派生画像です。原図の著作権表示と利用条件を以下に保持します。派生画像に含まれる独自の変更部分には、このリポジトリの MIT License を適用します。
+`Assets/chezmoi-original.png` は chezmoi ロゴに由来する提供画像です。`AppIcon.icon/Assets/` は上記 SVG の図形を家と鍵穴に分けて配置したものです。`AppIcon.icon`、`AppIcon.png`、`AppIcon.icns` および旧 `AppIcon-master.png` は macOS 用に調整した派生素材です。原図の著作権表示と利用条件を以下に保持します。独自の変更部分には、このリポジトリの MIT License を適用します。
 
 Chezmoi Menu は upstream の公式製品ではなく、名称やロゴの使用によって推奨・提携・承認を示すものではありません。
 
@@ -36,3 +36,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## Swift Subprocess / Swift System
+
+非同期プロセス実行に [Swift Subprocess](https://github.com/swiftlang/swift-subprocess) 1.0.2 と、依存する [Swift System](https://github.com/apple/swift-system) 1.8.1 を使用します。いずれも Apache License 2.0 with Runtime Library Exception です。各ソースの著作権は Apple Inc. and the Swift project authors に帰属します。
+
+各リポジトリのライセンス本文を [LICENSES/swift-subprocess.txt](LICENSES/swift-subprocess.txt) と [LICENSES/swift-system.txt](LICENSES/swift-system.txt) に保持します。Subprocess のソースヘッダーが参照する [Swift のライセンスと例外条項](https://www.swift.org/LICENSE.txt) は [LICENSES/swift-runtime.txt](LICENSES/swift-runtime.txt) に保持します。すべて配布アプリにも同梱します。独自コードの MIT License をこれらの依存コードへ上書きするものではありません。

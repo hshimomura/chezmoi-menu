@@ -1,6 +1,6 @@
 import AppKit
 
-enum BrandIcon {
+@MainActor enum BrandIcon {
     static let application: NSImage = {
         if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "png"),
            let image = NSImage(contentsOf: url) { return image }

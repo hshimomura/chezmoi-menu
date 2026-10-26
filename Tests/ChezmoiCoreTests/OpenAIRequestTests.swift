@@ -1,7 +1,7 @@
 import XCTest
 @testable import ChezmoiCore
 
-private final class ResponseStub: URLProtocol {
+private final class ResponseStub: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -46,6 +46,7 @@ private final class ResponseStub: URLProtocol {
     override func stopLoading() {}
 }
 
+@MainActor
 final class OpenAIRequestTests: XCTestCase {
     func testLunaUsesLowReasoningWithoutNetwork() async throws {
         let config = URLSessionConfiguration.ephemeral

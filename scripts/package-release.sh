@@ -9,9 +9,9 @@ if [[ "${1:-}" == --notarize && "${CHEZMOI_MENU_SIGN_IDENTITY:--}" == - ]]; then
     printf 'Notarization requires CHEZMOI_MENU_SIGN_IDENTITY (Developer ID Application).\n' >&2
     exit 2
 fi
-bash scripts/build-app.sh --universal
+bash scripts/build-app.sh
 APP_VERSION="$(tr -d '\r\n' < VERSION)"
-ARCHIVE_NAME="Chezmoi-Menu-${APP_VERSION}-universal.zip"
+ARCHIVE_NAME="Chezmoi-Menu-${APP_VERSION}-arm64.zip"
 APP="$PWD/dist/Chezmoi Menu.app"
 ARCHIVE="$PWD/dist/$ARCHIVE_NAME"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"

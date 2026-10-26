@@ -15,6 +15,22 @@ private struct FailingResolver: ConflictResolving {
     func resolve(_ conflict: Conflict) async throws -> Resolution { throw SyncError("simulated API failure") }
 }
 
+private actor WaitingResolver: ConflictResolving {
+    private var entered = false
+    func resolve(_ conflict: Conflict) async throws -> Resolution {
+        entered = true
+        try await Task.sleep(for: .seconds(30))
+        throw SyncError("resolver should have been cancelled")
+    }
+    func waitUntilEntered() async throws {
+        for _ in 0..<500 {
+            if entered { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw SyncError("resolver did not start")
+    }
+}
+
 private struct EditingResolver: ConflictResolving {
     let target: URL
     func resolve(_ conflict: Conflict) async throws -> Resolution {
@@ -26,7 +42,7 @@ private struct EditingResolver: ConflictResolving {
 private struct RacingResolver: ConflictResolving {
     let other: URL
     func resolve(_ conflict: Conflict) async throws -> Resolution {
-        let command = Command()
+        let command = FixtureCommand()
         try "remote raced\n".write(to: other.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try command.run("/usr/bin/git", ["add", "."], directory: other)
         try command.run("/usr/bin/git", ["commit", "-m", "concurrent push"], directory: other)
@@ -43,7 +59,7 @@ private final class Fixture {
     let remote: URL
     let config: URL
     let backups: URL
-    let command = Command()
+    let command = FixtureCommand()
     var settings = SyncSettings()
     let filename: String
 
@@ -108,13 +124,117 @@ private final class Fixture {
     }
 }
 
+@MainActor
 final class SyncEngineTests: XCTestCase {
-    func testCheckDoesNotApplyCommitPushOrCreateBackups() throws {
+    func testCancellationDuringAIAbortsMergeAndRejectsConcurrentOperation() async throws {
+        let f = try Fixture()
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let resolver = WaitingResolver()
+        let engine = f.engine(resolver: resolver)
+        let task = Task { try await engine.sync(.upload) }
+        try await resolver.waitUntilEntered()
+        do { _ = try await engine.check(); XCTFail("concurrent operation accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("別の操作")) }
+        task.cancel()
+        do { _ = try await task.value; XCTFail("cancel ignored") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        try f.assertNoMerge()
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try String(contentsOf: f.source.appendingPathComponent(f.filename), encoding: .utf8), "value=local\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        XCTAssertNotEqual(try f.git(["rev-parse", "HEAD"]).text, try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text)
+    }
+
+    func testCancellationAfterMergeRetainsPendingApplyAndBlocksReimport() async throws {
+        let f = try Fixture()
+        try f.remoteChange("value=remote\n")
+        let engine = SyncEngine(settings: f.settings, backups: f.backups, resolver: nil, onEvent: { event in
+            if event.phase == .validating { withUnsafeCurrentTask { $0?.cancel() } }
+        })
+        let task = Task { try await engine.sync(.download) }
+        do { _ = try await task.value; XCTFail("cancel ignored") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(try f.targetContent(), "value=base\n")
+        XCTAssertEqual(try String(contentsOf: f.source.appendingPathComponent(f.filename), encoding: .utf8), "value=remote\n")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        do { _ = try await f.engine().sync(.download); XCTFail("pending apply ignored") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("apply")) }
+    }
+
+    func testPreviewIsReadOnlyAndOmitsExcludedContent() async throws {
+        let f = try Fixture()
+        try f.writeTarget("value=local\n")
+        try "sensitive=source\n".write(to: f.source.appendingPathComponent("dot_env"), atomically: true, encoding: .utf8)
+        try "sensitive=home\n".write(to: f.home.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        let head = try f.git(["rev-parse", "HEAD"]).text
+        let preview = try await f.engine(resolver: FailingResolver()).preview()
+        XCTAssertEqual(preview.files, [".test"])
+        XCTAssertEqual(preview.omittedCount, 1)
+        XCTAssertTrue(preview.text.contains("value=local"))
+        XCTAssertFalse(preview.text.contains("sensitive"))
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try f.git(["rev-parse", "HEAD"]).text, head)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.backups.path))
+    }
+
+    func testPreviewWithOnlyExcludedFilesDoesNotFallBackToAllFiles() async throws {
+        let f = try Fixture(filename: "dot_env")
+        try f.writeTarget("sensitive=local\n")
+        let preview = try await f.engine().preview()
+        XCTAssertEqual(preview.omittedCount, 1)
+        XCTAssertTrue(preview.files.isEmpty)
+        XCTAssertEqual(preview.text, "")
+    }
+
+    func testCancellationDuringApplyWaitsForCompletion() async throws {
+        let f = try Fixture()
+        try f.remoteChange("value=remote\n")
+        let started = f.root.appendingPathComponent("apply-started")
+        let completed = f.root.appendingPathComponent("apply-completed")
+        let wrapper = f.root.appendingPathComponent("chezmoi-wrapper")
+        let script = """
+        #!/bin/sh
+        applying=no
+        dry=no
+        for arg in "$@"; do
+            [ "$arg" = apply ] && applying=yes
+            [ "$arg" = --dry-run ] && dry=yes
+        done
+        if [ "$applying" = yes ] && [ "$dry" = no ]; then
+            touch '\(started.path)'
+            sleep 0.5
+            '\(f.settings.chezmoiPath)' "$@"
+            result=$?
+            [ "$result" = 0 ] && touch '\(completed.path)'
+            exit "$result"
+        fi
+        exec '\(f.settings.chezmoiPath)' "$@"
+        """
+        try script.write(to: wrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
+        f.settings.chezmoiPath = wrapper.path
+        let engine = f.engine()
+        let task = Task { try await engine.sync(.download) }
+        for _ in 0..<500 {
+            if FileManager.default.fileExists(atPath: started.path) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: started.path))
+        task.cancel()
+        _ = try await task.value
+        XCTAssertTrue(FileManager.default.fileExists(atPath: completed.path))
+        XCTAssertEqual(try f.targetContent(), "value=remote\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        try f.assertNoMerge()
+    }
+
+    func testCheckDoesNotApplyCommitPushOrCreateBackups() async throws {
         let f = try Fixture()
         try f.writeTarget("value=local\n")
         let before = try f.git(["rev-parse", "HEAD"]).text
         let indexBefore = try Data(contentsOf: f.source.appendingPathComponent(".git/index"))
-        let report = try f.engine(resolver: FailingResolver()).check()
+        let report = try await f.engine(resolver: FailingResolver()).check()
         XCTAssertEqual(report.destination, f.home.resolvingSymlinksInPath().path)
         XCTAssertEqual(report.managedCount, 1)
         XCTAssertEqual(report.localCaptures, 1)
@@ -127,11 +247,11 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/FETCH_HEAD").path))
     }
 
-    func testCheckDetectsNewRemoteWithoutUpdatingTrackingRef() throws {
+    func testCheckDetectsNewRemoteWithoutUpdatingTrackingRef() async throws {
         let f = try Fixture()
         let tracking = try f.git(["rev-parse", "origin/main"]).text
         try f.remoteChange("value=remote\n")
-        let report = try f.engine().check()
+        let report = try await f.engine().check()
         XCTAssertFalse(report.remoteMatches)
         XCTAssertEqual(try f.git(["rev-parse", "origin/main"]).text, tracking)
         XCTAssertEqual(try f.targetContent(), "value=base\n")

@@ -1,24 +1,27 @@
 # アイコン
 
-chezmoi のロゴ画像を基に、家・鍵穴・曲線の土台を残して macOS 向けの表示を作成しました。元の図形は [upstream のロゴ](https://github.com/twpayne/chezmoi/blob/master/assets/images/logo-256px.svg) に由来します。帰属とライセンス本文は [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) を参照してください。
+chezmoi の家・鍵穴・曲線の土台を保ち、macOS 27 向けのレイヤー付きアイコンにしました。[upstream の原図](https://github.com/twpayne/chezmoi/blob/e5ae319347c3efa0acbc3d2ab2a01e5abf62b276/assets/images/logo-256px.svg) のパスを使用し、家と鍵穴を分離しています。帰属と MIT License 本文は [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) を参照してください。
 
-- `chezmoi-original.png`: 提供された原図のコピー。メニューバーの単色マークに使用。
-- `AppIcon-master.png`: built-in ImageGen で生成した最終アートワーク。元画像は上書きしていません。
-- `AppIcon.png`: 1024 × 1024 px の PNG。
-- `AppIcon.icns`: 16 / 32 / 128 / 256 / 512 pt と各 Retina 解像度を含む macOS アイコン。
+| 素材 | 用途 |
+| --- | --- |
+| `AppIcon.icon/icon.json` | Icon Composer の正本。背景・明暗の色・ガラス効果 |
+| `AppIcon.icon/Assets/House.svg` | 家と曲線のベクターレイヤー |
+| `AppIcon.icon/Assets/Keyhole.svg` | 鍵穴のベクターレイヤー |
+| `AppIcon.png` / `AppIcon.icns` | Xcode のレンダラーから生成したフォールバック |
+| `chezmoi-original.png` | 提供された原図。メニューバーの template image |
+| `AppIcon-master.png` | 0.1 系で使用した旧アートワーク。現在のビルドでは使用しない |
 
-設定画面と Finder のアプリアイコンにタイル版を使用します。メニューバーでは元のマークを AppKit の template image として表示し、OS が背景に応じた単色へ自動調整します。同期中は進行を示すシステムシンボルを表示します。
+明るい外観は暖色の白い背景とグレーの図形、暗い外観は暗い背景と明るい図形です。角丸・光・レイヤーの表現は Icon Composer に任せます。メニューバーは背景に合わせて OS が色を決める単色画像です。
 
-アプリアイコンは静的な PNG / ICNS です。Icon Composer のレイヤーや、動的な Liquid Glass の光源・外観バリエーションは含みません。構成の参考: [Apple Human Interface Guidelines — App icons](https://developer.apple.com/design/human-interface-guidelines/app-icons)。
+## 生成
 
-## 生成方法
+Xcode 27.1 以降で `AppIcon.icon` を Icon Composer から編集できます。
 
-built-in ImageGen を使用しました。CLI/API fallback やアプリの保存済み OpenAI API key は使用していません。
-
-最終採用画像のプロンプト:
-
-```text
-Create a clean production macOS app icon using this exact chezmoi house-and-keyhole silhouette as the edit target. Vector-sharp, smooth flat graphic construction, no photographic rendering. A simple soft pearl-white/light-gray rounded-square tile with a continuous smooth boundary; centered warm dark-gray house logo preserving the peaked roof, the original roof eaves and upright walls, central keyhole and gently curved baseline. The logo is solid high-contrast graphite, with only an extremely subtle bevel INSIDE its edges. Tile is centered at 82 percent of the square canvas width, logo at 64 percent. Restrained native Mac utility icon. The rounded-square tile is fully opaque, everything outside the tile fully transparent. ABSOLUTELY NO outer shadows, NO glows, NO semi-transparent fringe, NO noise, NO texture, NO grain, NO white flecks, NO painterly borders. The outside contour must be perfectly clean like an SVG. Only subtle gradients within the tile and logo, no effects outside their clean geometrical boundaries. No text, no badge, no extra shapes, no colored accents. Single centered icon asset, square canvas, transparent margin uniform on all sides.
+```sh
+bash scripts/build-icons.sh
+bash scripts/build-app.sh
 ```
 
-`bash scripts/build-icons.sh` でサイズ別の画像と ICNS を再作成します。`bash scripts/build-app.sh` では生成したリソースを `.app` にコピーし、`CFBundleIconFile` を設定してから署名します。
+前者は `ictool --design-generation 27` で PNG、`sips` / `iconutil` で ICNS を生成します。後者は `actool` でネイティブのレイヤーを `Assets.car` にコンパイルし、`CFBundleIconName = AppIcon` を設定してから署名します。PNG は設定画面のブランド表示にも使用します。
+
+このバージョンの生成に ImageGen や OpenAI API は使用しません。[Apple Icon Composer](https://developer.apple.com/icon-composer/) と [App icons HIG](https://developer.apple.com/design/human-interface-guidelines/app-icons) を参照してください。
