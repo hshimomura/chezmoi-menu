@@ -19,7 +19,8 @@ Swift tools version は 6.0、コンパイラの言語モードは Swift 5 で�
 ```sh
 brew install chezmoi
 swift test --disable-sandbox
-bash -n scripts/build-app.sh scripts/build-icons.sh
+bash -n scripts/build-app.sh scripts/build-icons.sh scripts/package-release.sh
+python3 -m unittest discover -s Tests/DistributionTests
 bash scripts/build-app.sh
 codesign --verify --strict "dist/Chezmoi Menu.app"
 open "dist/Chezmoi Menu.app"
@@ -35,8 +36,20 @@ open "dist/Chezmoi Menu.app"
 
 ## テストと CI
 
-[テストの説明](TESTING.md) を参照してください。GitHub Actions は macOS 上で chezmoi を用意し、テストとアプリビルドを実行します。OpenAI API key やユーザーの dotfiles は必要ありません。
+[テストの説明](TESTING.md) を参照してください。GitHub Actions は macOS の Apple Silicon / Intel ランナーで chezmoi を用意し、テストと Universal アプリビルドを実行します。OpenAI API key やユーザーの dotfiles、署名・公証の認証情報は必要ありません。CI のビルドは ad-hoc 署名です。
 
 ## 配布
 
-現在のビルドはローカル用の ad-hoc 署名です。第三者向けバイナリ配布には Developer ID 署名、notarization、配布アーキテクチャなどの設計が別途必要です。ロゴの帰属を含む `LICENSE` と `THIRD_PARTY_NOTICES.md` を保持してください。
+`VERSION` がバージョンの正本です。通常ビルドは ad-hoc 署名ですが、`CHEZMOI_MENU_SIGN_IDENTITY` にローカルの Developer ID Application 証明書名またはハッシュを指定すると Hardened Runtime と secure timestamp を有効にして署名します。個人の署名情報はソースへ書き込みません。
+
+```sh
+# 署名済み Universal ZIP とチェックサムを生成
+CHEZMOI_MENU_SIGN_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)' \
+  bash scripts/package-release.sh --notarize
+```
+
+公証スクリプトは `~/.env` の `ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_KEY_FILEPATH` だけを読みます。環境変数で渡すこともできます。環境変数とファイルの両方に値がある場合はファイルの値を優先します。`ASC_KEY_FILEPATH` は App Store Connect API の秘密鍵 `.p8` を指します。チームキーは issuer を指定し、個人キーの場合は issuer を空欄にします。`.env` をシェルで source せず、指定外の変数やコマンドは実行しません。
+
+Apple へ ZIP を提出し、承認後にチケットを staple / validate してから ZIP を作り直します。最終 ZIP と `.sha256` が公開対象です。`dist/notarization.json` などのローカル結果と、認証情報・秘密鍵は公開しません。処理が長い場合は、表示された提出 ID と `scripts/notarize-app.py --resume` で再開できます。再開時も承認後に ZIP を作り直し、チェックサムを更新してから配布してください。
+
+`--notarize` を省略すると、署名後の ZIP だけを生成します。そのアーカイブを公証済みと表示してはいけません。Developer ID 署名・Apple 公証の完了と両アーキテクチャの検証後、GitHub Release に ZIP とチェックサムを公開します。ロゴの帰属を含む `LICENSE` と `THIRD_PARTY_NOTICES.md` をアプリへ同梱します。

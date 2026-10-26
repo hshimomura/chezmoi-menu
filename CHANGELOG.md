@@ -1,5 +1,13 @@
 # 変更履歴
 
+## 0.1.1 — 2026-10-26
+
+- Apple Silicon / Intel に対応する Universal ビルドと ZIP 配布。
+- Developer ID 署名・Apple 公証・公証チケット添付の配布手順。
+- 別の Mac へのインストール手順と SHA-256 チェックサム。
+- App Store Connect 認証情報を限定して読み込むスクリプトとテスト。
+- Apple Silicon / Intel の CI 検証。
+
 ## 0.1.0 — 2026-10-26
 
 - macOS のメニューバーから Download / Upload 同期を実行。

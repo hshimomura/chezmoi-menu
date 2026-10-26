@@ -12,5 +12,10 @@ xcuserdata/
 Backups/
 backups/
 *.log
+__pycache__/
+*.pyc
+*.p8
+*.p12
+*.mobileprovision
 # Local validation notes may contain machine-specific paths. Public coverage is in docs/TESTING.md.
 /TEST-RESULTS.md

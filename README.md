@@ -20,15 +20,22 @@ macOS のメニューバーから [chezmoi](https://www.chezmoi.io/) を Downloa
 ## 必要なもの
 
 - macOS 14 以降。
-- ビルド用の Swift 6 対応 Xcode / Command Line Tools。
 - [chezmoi](https://www.chezmoi.io/install/)、Git、および初期化済みの dotfiles リポジトリ。
 - AI 競合解決を使う場合は、課金と利用権限を設定した OpenAI API key。
 
 通常の同期と同期前チェックは、競合がなければ API key なしでも実行できます。Swift の外部パッケージには依存していません。
 
-## ビルドと起動
+## 別の Mac にインストール
 
-このリポジトリにビルド済みアプリは含めていません。利用する Mac でビルドしてください。
+[GitHub Releases](https://github.com/hshimomura/chezmoi-menu/releases/latest) の **Universal 版 ZIP** を展開し、`Chezmoi Menu.app` を `~/Applications` または `/Applications` に移して起動します。Apple Silicon / Intel の両方で利用でき、アプリのビルドは不要です。
+
+配布版は Developer ID 署名と Apple 公証を行い、公証チケットを添付しています。chezmoi・Git・dotfiles の設定と Git 認証、AI 用 API key は各 Mac に用意してください。API key は Mac ごとのキーチェーンに保存します。
+
+**[別の Mac への詳しい導入・更新手順](docs/INSTALL.md)**
+
+## ソースからビルドと起動
+
+Swift 6 対応の Xcode / Command Line Tools が必要です。
 
 ```sh
 brew install chezmoi
@@ -40,7 +47,7 @@ open "dist/Chezmoi Menu.app"
 
 初回は設定画面が開きます。継続して使う場合は、アプリを終了してから `dist/Chezmoi Menu.app` を `~/Applications` にコピーし、そのコピーを起動してください。Dock には常駐せず、メニューバーの家と鍵穴のマークから操作できます。
 
-ビルドは実行中の Mac のアーキテクチャ向けで、ローカル用の ad-hoc 署名を行います。Developer ID 署名・notarization・自動アップデートは提供していません。
+通常ビルドは実行中の Mac 向けで、ローカル用の ad-hoc 署名を行います。`bash scripts/build-app.sh --universal` では両アーキテクチャを含めます。署名・公証を伴う配布ビルドは [開発手順](docs/DEVELOPMENT.md) を参照してください。自動アップデート機能はありません。
 
 ## 最初の設定
 
@@ -64,6 +71,7 @@ open "dist/Chezmoi Menu.app"
 
 ## ドキュメント
 
+- [別の Mac へのインストール](docs/INSTALL.md)
 - [使い方と同期の前提](docs/USAGE.md)
 - [バックアップ・停止時の復旧](docs/RECOVERY.md)
 - [データ保存と AI への送信範囲](docs/SECURITY.md)
