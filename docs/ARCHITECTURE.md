@@ -32,6 +32,8 @@ Swift 6.4 の `withTaskCancellationShield` を使用し、re-add・add・commit�
 
 `MenuBarExtra` の window style で進捗と停止を表示します。設定は NavigationSplitView で同期・差分・一般・OpenAI・履歴を切り替えます。ボタンは標準の glass スタイルを使用します。
 
+差分画面は source の未コミット変更、取得済み upstream と HEAD、Mac と source の比較を切り替えます。source のコミットは同期とは別のエンジン操作で、同じ busy guard・flock・バックアップ・キャンセル保護を使用します。source を全件 stage / commit した後に差分を読み直し、UI を upstream 比較へ切り替えます。fetch・merge・apply・push は既存の同期操作が担当します。暗号化・除外パスは差分本文の取得前に除外し、名前のみ UI へ返します。
+
 App Intents は同期と同じ経路を呼び、処理完了まで待って結果を返します。手動実行の支援であり、常時監視や定期同期は追加しません。配布時は `appintentsmetadataprocessor` でメタデータを同梱します。
 
 アイコンは Icon Composer の家・鍵穴レイヤーと明暗バリエーションから `actool` で構築します。設定 JSON の形式、Application Support の保存先、Keychain の service / account は維持し、移行のためのキー再入力は不要です。

@@ -63,8 +63,8 @@ private final class Fixture {
     var settings = SyncSettings()
     let filename: String
 
-    init(filename: String = "dot_test", content: String = "value=base\n") throws {
-        self.filename = filename
+    init(filename: String = "dot_test", content: String = "value=base\n", encryptedEnv: Bool = false) throws {
+        self.filename = encryptedEnv ? "encrypted_private_dot_env.age" : filename
         root = FileManager.default.temporaryDirectory.appendingPathComponent("chezmoi-menu-tests-" + UUID().uuidString)
         source = root.appendingPathComponent("source")
         other = root.appendingPathComponent("other")
@@ -75,11 +75,21 @@ private final class Fixture {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         settings.chezmoiPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/chezmoi") ? "/opt/homebrew/bin/chezmoi" : "/usr/local/bin/chezmoi"
         settings.configPath = config.path
-        let json: [String: Any] = ["sourceDir": source.path, "destDir": home.path,
+        var json: [String: Any] = ["sourceDir": source.path, "destDir": home.path,
             "persistentState": root.appendingPathComponent("state.boltdb").path,
             "cacheDir": root.appendingPathComponent("cache").path,
             "git": ["autoCommit": false, "autoPush": false, "autoAdd": false]]
         try JSONSerialization.data(withJSONObject: json).write(to: config)
+        if encryptedEnv {
+            // Generate a disposable identity outside Git; never use the user's age key.
+            let identity = root.appendingPathComponent("key.txt")
+            try chez(["age-keygen", "--output", identity.path])
+            let recipient = try chez(["age-keygen", "--convert", identity.path]).text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            json["encryption"] = "age"
+            json["age"] = ["identity": identity.path, "recipient": recipient]
+            try JSONSerialization.data(withJSONObject: json).write(to: config)
+        }
         try command.run("/usr/bin/git", ["init", "--bare", "--initial-branch=main", remote.path])
         try command.run("/usr/bin/git", ["clone", remote.path, source.path])
         try configure(source)
@@ -104,7 +114,15 @@ private final class Fixture {
         try command.run(settings.chezmoiPath, ["--config", config.path, "--no-tty", "--no-pager"] + args)
     }
     func writeSource(_ text: String, at url: URL? = nil) throws {
-        try text.write(to: (url ?? source).appendingPathComponent(filename), atomically: true, encoding: .utf8)
+        let file = (url ?? source).appendingPathComponent(filename)
+        if filename == "encrypted_private_dot_env.age" {
+            let plaintext = root.appendingPathComponent("env-input")
+            try text.write(to: plaintext, atomically: true, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(at: plaintext) }
+            try chez(["encrypt", "--output", file.path, plaintext.path])
+        } else {
+            try text.write(to: file, atomically: true, encoding: .utf8)
+        }
     }
     func remoteChange(_ text: String) throws {
         try writeSource(text, at: other)
@@ -112,7 +130,9 @@ private final class Fixture {
         try git(["commit", "-m", "remote change"], at: other)
         try git(["push"], at: other)
     }
-    var target: URL { home.appendingPathComponent(filename.replacingOccurrences(of: "dot_", with: ".")) }
+    var target: URL {
+        home.appendingPathComponent(filename == "encrypted_private_dot_env.age" ? ".env" : filename.replacingOccurrences(of: "dot_", with: "."))
+    }
     func writeTarget(_ text: String) throws { try text.write(to: target, atomically: true, encoding: .utf8) }
     func targetContent() throws -> String { try String(contentsOf: target, encoding: .utf8) }
     func engine(resolver: (any ConflictResolving)? = nil) -> SyncEngine {
@@ -126,6 +146,283 @@ private final class Fixture {
 
 @MainActor
 final class SyncEngineTests: XCTestCase {
+    func testMultipleSourceFilesWithEncryptedEnvCommitAllChanges() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        let initial = ["dot_alpha": "alpha=base\n", "dot_deleted": "deleted=base\n",
+                       "dot_old": "renamed=base\n", "private_dot_credentials": "credential=base\n"]
+        for (path, content) in initial {
+            try content.write(to: f.source.appendingPathComponent(path), atomically: true, encoding: .utf8)
+        }
+        try f.git(["add", "--all"])
+        try f.git(["commit", "-m", "Add multiple managed files"])
+        try f.git(["push"])
+        try f.chez(["apply", "--force"])
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+
+        try f.writeSource("value=env-edited\n")
+        try "alpha=edited\n".write(to: f.source.appendingPathComponent("dot_alpha"), atomically: true, encoding: .utf8)
+        try f.git(["add", "dot_alpha"])
+        try FileManager.default.removeItem(at: f.source.appendingPathComponent("dot_deleted"))
+        try f.git(["mv", "dot_old", "dot_renamed"])
+        try "new=edited\n".write(to: f.source.appendingPathComponent("new [config].txt"), atomically: true, encoding: .utf8)
+        try "credential=edited\n".write(to: f.source.appendingPathComponent("private_dot_credentials"), atomically: true, encoding: .utf8)
+
+        let visible = ["dot_alpha", "dot_deleted", "dot_old", "dot_renamed", "new [config].txt"]
+        let hidden = ["encrypted_private_dot_env.age", "private_dot_credentials"]
+        let engine = f.engine(resolver: FailingResolver())
+        let before = try await engine.sourcePreview()
+        XCTAssertEqual(before.uncommitted.files, visible)
+        XCTAssertEqual(before.uncommitted.omittedFiles, hidden)
+        XCTAssertTrue(before.uncommitted.text.contains("+alpha=edited"))
+        XCTAssertTrue(before.uncommitted.text.contains("-deleted=base"))
+        XCTAssertTrue(before.uncommitted.text.contains("+new=edited"))
+        XCTAssertTrue(before.uncommitted.text.contains("deleted file mode"))
+        XCTAssertTrue(before.uncommitted.text.contains("new file mode"))
+        XCTAssertFalse(before.uncommitted.text.contains("env-edited"))
+        XCTAssertFalse(before.uncommitted.text.contains("credential=edited"))
+
+        let report = try await engine.commitSource(message: "Update multiple files")
+        XCTAssertTrue(report.preview.uncommitted.files.isEmpty)
+        XCTAssertTrue(report.preview.uncommitted.omittedFiles.isEmpty)
+        XCTAssertEqual(report.preview.upstream?.files, visible)
+        XCTAssertEqual(report.preview.upstream?.omittedFiles, hidden)
+        XCTAssertEqual(report.preview.ahead, 1)
+        XCTAssertEqual(try f.git(["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "HEAD"]).text
+            .split(separator: "\n").map(String.init).sorted(), (visible + hidden).sorted())
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        XCTAssertEqual(try f.targetContent(), "value=base\n")
+        XCTAssertEqual(try String(contentsOf: f.home.appendingPathComponent(".alpha"), encoding: .utf8), "alpha=base\n")
+        try f.assertNoMerge()
+    }
+
+    func testMultipleDestinationFilesWithEncryptedEnvPreviewAndUpload() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        for name in ["alpha", "beta"] {
+            try "\(name)=base\n".write(to: f.source.appendingPathComponent("dot_" + name), atomically: true, encoding: .utf8)
+        }
+        try f.git(["add", "--all"])
+        try f.git(["commit", "-m", "Add destination fixtures"])
+        try f.git(["push"])
+        try f.chez(["apply", "--force"])
+        for name in ["alpha", "beta"] {
+            try "\(name)=edited\n".write(to: f.home.appendingPathComponent("." + name), atomically: true, encoding: .utf8)
+        }
+        try f.writeTarget("value=env-edited\n")
+        let head = try f.git(["rev-parse", "HEAD"]).text
+        let index = try Data(contentsOf: f.source.appendingPathComponent(".git/index"))
+        let engine = f.engine(resolver: FailingResolver())
+        let preview = try await engine.preview()
+        XCTAssertEqual(preview.files.sorted(), [".alpha", ".beta"])
+        XCTAssertEqual(preview.omittedFiles, [".env"])
+        XCTAssertTrue(preview.text.contains("alpha=edited"))
+        XCTAssertTrue(preview.text.contains("beta=edited"))
+        XCTAssertFalse(preview.text.contains("env-edited"))
+        XCTAssertEqual(try f.git(["rev-parse", "HEAD"]).text, head)
+        XCTAssertEqual(try Data(contentsOf: f.source.appendingPathComponent(".git/index")), index)
+
+        _ = try await engine.sync(.upload)
+        for name in ["alpha", "beta"] {
+            XCTAssertEqual(try f.git(["show", "HEAD:dot_" + name], at: f.remote).text, "\(name)=edited\n")
+        }
+        XCTAssertEqual(try f.git(["show", "HEAD:encrypted_private_dot_env.age"], at: f.remote).data,
+                       try Data(contentsOf: f.source.appendingPathComponent("encrypted_private_dot_env.age")))
+        XCTAssertEqual(try f.targetContent(), "value=env-edited\n")
+        let after = try await engine.preview()
+        XCTAssertTrue(after.files.isEmpty)
+        XCTAssertTrue(after.omittedFiles.isEmpty)
+        try f.assertNoMerge()
+    }
+
+    func testMultipleSourceFilesRemainListedAndCommittedWhenDiffIsTruncated() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeSource("value=env-edited\n")
+        try String(repeating: "large-file-line\n", count: 10_000)
+            .write(to: f.source.appendingPathComponent("a-large.txt"), atomically: true, encoding: .utf8)
+        try "small-file-content\n".write(to: f.source.appendingPathComponent("z-small.txt"), atomically: true, encoding: .utf8)
+        let engine = f.engine()
+        let before = try await engine.sourcePreview()
+        XCTAssertEqual(before.uncommitted.files, ["a-large.txt", "z-small.txt"])
+        XCTAssertEqual(before.uncommitted.omittedFiles, ["encrypted_private_dot_env.age"])
+        XCTAssertTrue(before.uncommitted.truncated)
+        XCTAssertEqual(before.uncommitted.text.count, 100_000)
+
+        let report = try await engine.commitSource(message: "Commit all files despite preview limit")
+        XCTAssertEqual(report.preview.upstream?.files, ["a-large.txt", "z-small.txt"])
+        XCTAssertEqual(report.preview.upstream?.omittedFiles, ["encrypted_private_dot_env.age"])
+        XCTAssertEqual(report.preview.upstream?.truncated, true)
+        XCTAssertEqual(try f.git(["show", "HEAD:z-small.txt"]).text, "small-file-content\n")
+        XCTAssertTrue(report.preview.uncommitted.files.isEmpty)
+        XCTAssertTrue(report.preview.uncommitted.omittedFiles.isEmpty)
+        try f.assertNoMerge()
+    }
+
+    func testSourceCommitShowsEncryptedEnvBeforeAndAfterCommitWithoutSendingOrApplying() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        f.settings.excludedAIPaths = ""
+        try f.writeSource("value=source-edit\n")
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        let indexBefore = try Data(contentsOf: f.source.appendingPathComponent(".git/index"))
+        let engine = f.engine(resolver: FailingResolver())
+        let before = try await engine.sourcePreview()
+        XCTAssertEqual(before.uncommitted.omittedFiles, ["encrypted_private_dot_env.age"])
+        XCTAssertEqual(before.uncommitted.text, "")
+        XCTAssertEqual(before.ahead, 0)
+        XCTAssertEqual(try Data(contentsOf: f.source.appendingPathComponent(".git/index")), indexBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.backups.path))
+
+        let report = try await engine.commitSource(message: "Update encrypted env")
+        XCTAssertTrue(report.preview.uncommitted.files.isEmpty)
+        XCTAssertTrue(report.preview.uncommitted.omittedFiles.isEmpty)
+        XCTAssertEqual(report.preview.upstream?.omittedFiles, ["encrypted_private_dot_env.age"])
+        XCTAssertEqual(report.preview.upstream?.text, "")
+        XCTAssertEqual(report.preview.ahead, 1)
+        XCTAssertEqual(report.preview.behind, 0)
+        XCTAssertEqual(try f.git(["log", "-1", "--format=%s"]).text, "Update encrypted env\n")
+        XCTAssertEqual(try f.targetContent(), "value=base\n")
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: report.backup.appendingPathComponent("source/.git").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        // A subsequent Upload still applies and sends the committed source edit.
+        _ = try await engine.sync(.upload)
+        XCTAssertEqual(try f.targetContent(), "value=source-edit\n")
+        try f.assertNoMerge()
+    }
+
+    func testSourcePreviewIncludesStagedUnstagedAndUntrackedLiteralPaths() async throws {
+        let f = try Fixture()
+        try f.writeSource("value=staged\n")
+        try f.git(["add", "dot_test"])
+        try f.writeSource("value=worktree\n")
+        let name = "new [config].txt"
+        try "new-file-content\n".write(to: f.source.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        let preview = try await f.engine().sourcePreview()
+        XCTAssertEqual(preview.uncommitted.files, ["dot_test", name])
+        XCTAssertTrue(preview.uncommitted.text.contains("+value=worktree"))
+        XCTAssertTrue(preview.uncommitted.text.contains("+new-file-content"))
+        let report = try await f.engine().commitSource(message: "Capture source edits")
+        XCTAssertEqual(report.preview.upstream?.files.sorted(), ["dot_test", name])
+        XCTAssertTrue(report.preview.uncommitted.files.isEmpty)
+        XCTAssertEqual(try f.git(["status", "--porcelain"]).text, "")
+    }
+
+    func testSourcePreviewDoesNotExecuteExternalDiffOrTextConversion() async throws {
+        let f = try Fixture()
+        let marker = f.root.appendingPathComponent("diff-driver-ran")
+        let driver = f.root.appendingPathComponent("diff-driver")
+        try "#!/bin/sh\ntouch '\(marker.path)'\n".write(to: driver, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: driver.path)
+        try f.git(["config", "diff.test.command", driver.path])
+        try f.git(["config", "diff.test.textconv", driver.path])
+        try "dot_test diff=test\n".write(to: f.source.appendingPathComponent(".gitattributes"), atomically: true, encoding: .utf8)
+        try f.writeSource("value=edit\n")
+        let preview = try await f.engine().sourcePreview()
+        XCTAssertTrue(preview.uncommitted.text.contains("+value=edit"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    func testSourceCommitWithoutUpstreamStillCommitsLocally() async throws {
+        let f = try Fixture()
+        try f.git(["branch", "--unset-upstream"])
+        try f.writeSource("value=edit\n")
+        let preview = try await f.engine().sourcePreview()
+        XCTAssertNil(preview.upstream)
+        let report = try await f.engine().commitSource(message: "Local edit")
+        XCTAssertNil(report.preview.upstream)
+        XCTAssertEqual(try f.git(["status", "--porcelain"]).text, "")
+    }
+
+    func testSourceCommitRejectsEmptyMessageNoChangesAndPendingApply() async throws {
+        let f = try Fixture()
+        let head = try f.git(["rev-parse", "HEAD"]).text
+        do { _ = try await f.engine().commitSource(message: "  "); XCTFail("empty message accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("メッセージ")) }
+        do { _ = try await f.engine().commitSource(message: "No edits"); XCTFail("empty commit accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("未コミット変更はありません")) }
+        try f.writeSource("value=edit\n")
+        try Data("{}".utf8).write(to: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json"))
+        do { _ = try await f.engine().commitSource(message: "Pending"); XCTFail("pending apply accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("未完了")) }
+        XCTAssertEqual(try f.git(["rev-parse", "HEAD"]).text, head)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.backups.path))
+    }
+
+    func testEncryptedEnvUploadAndDownloadOnAnotherDestination() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        let check = try await f.engine().check()
+        XCTAssertEqual(check.localCaptures, 1)
+        _ = try await f.engine(resolver: FailingResolver()).sync(.upload)
+        let ciphertext = try f.git(["show", "HEAD:encrypted_private_dot_env.age"], at: f.remote).data
+        XCTAssertFalse(String(decoding: ciphertext, as: UTF8.self).contains("value=local"))
+        XCTAssertEqual(try f.git(["ls-tree", "-r", "--name-only", "HEAD"], at: f.remote).text,
+                       "encrypted_private_dot_env.age\n")
+
+        // Use a separate source, destination and state database, as on a second Mac.
+        let secondHome = f.root.appendingPathComponent("second-home")
+        try FileManager.default.createDirectory(at: secondHome, withIntermediateDirectories: true)
+        var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: f.config)) as? [String: Any])
+        config["sourceDir"] = f.other.path
+        config["destDir"] = secondHome.path
+        config["persistentState"] = f.root.appendingPathComponent("second-state.boltdb").path
+        let configURL = f.root.appendingPathComponent("second-chezmoi.json")
+        try JSONSerialization.data(withJSONObject: config).write(to: configURL)
+        var settings = f.settings
+        settings.configPath = configURL.path
+        let second = SyncEngine(settings: settings, backups: f.root.appendingPathComponent("second-backups"),
+                                resolver: FailingResolver())
+        _ = try await second.sync(.download)
+        let target = secondHome.appendingPathComponent(".env")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "value=local\n")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? Int, 0o600)
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        try f.assertNoMerge()
+    }
+
+    func testEncryptedEnvSourceEditIsAppliedAndPushed() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        // Equivalent to saving chezmoi edit ~/.env, before apply.
+        try f.writeSource("value=source-edit\n")
+        _ = try await f.engine(resolver: FailingResolver()).sync(.upload)
+        XCTAssertEqual(try f.targetContent(), "value=source-edit\n")
+        XCTAssertEqual(try f.git(["rev-parse", "HEAD"]).text,
+                       try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text)
+    }
+
+    func testEncryptedEnvConflictNeverReachesResolverEvenWithoutExclusions() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        f.settings.excludedAIPaths = ""
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        do { _ = try await f.engine(resolver: FailingResolver()).sync(.upload); XCTFail("must stop") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("除外対象")) }
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        try f.assertNoMerge()
+    }
+
+    func testEncryptedEnvPreviewIsOmittedEvenWithoutExclusions() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        f.settings.excludedAIPaths = ""
+        try f.writeTarget("value=local\n")
+        let preview = try await f.engine().preview()
+        XCTAssertEqual(preview.omittedCount, 1)
+        XCTAssertEqual(preview.omittedFiles, [".env"])
+        XCTAssertTrue(preview.files.isEmpty)
+        XCTAssertEqual(preview.text, "")
+    }
+
+    func testEncryptedEnvMissingIdentityStopsCheckWithoutChangingFiles() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        let head = try f.git(["rev-parse", "HEAD"]).text
+        try FileManager.default.removeItem(at: f.root.appendingPathComponent("key.txt"))
+        do { _ = try await f.engine().check(); XCTFail("missing identity accepted") }
+        catch { XCTAssertTrue(error is SyncError) }
+        XCTAssertEqual(try f.git(["rev-parse", "HEAD"]).text, head)
+        XCTAssertEqual(try f.targetContent(), "value=base\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.backups.path))
+    }
+
     func testCancellationDuringAIAbortsMergeAndRejectsConcurrentOperation() async throws {
         let f = try Fixture()
         try f.writeTarget("value=local\n")
@@ -171,6 +468,7 @@ final class SyncEngineTests: XCTestCase {
         let preview = try await f.engine(resolver: FailingResolver()).preview()
         XCTAssertEqual(preview.files, [".test"])
         XCTAssertEqual(preview.omittedCount, 1)
+        XCTAssertEqual(preview.omittedFiles, [".env"])
         XCTAssertTrue(preview.text.contains("value=local"))
         XCTAssertFalse(preview.text.contains("sensitive"))
         XCTAssertEqual(try f.targetContent(), "value=local\n")
@@ -183,6 +481,7 @@ final class SyncEngineTests: XCTestCase {
         try f.writeTarget("sensitive=local\n")
         let preview = try await f.engine().preview()
         XCTAssertEqual(preview.omittedCount, 1)
+        XCTAssertEqual(preview.omittedFiles, [".env"])
         XCTAssertTrue(preview.files.isEmpty)
         XCTAssertEqual(preview.text, "")
     }

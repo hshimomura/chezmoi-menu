@@ -14,7 +14,7 @@ macOS 27 以降の Apple Silicon Mac で利用できます。arm64 専用で、�
 ダウンロードの整合性を確認したい場合は、同じ Release の `.sha256` ファイルも ZIP と同じフォルダへ保存し、そのフォルダで実行します。
 
 ```sh
-shasum -a 256 -c Chezmoi-Menu-0.2.0-arm64.zip.sha256
+shasum -a 256 -c Chezmoi-Menu-0.3.0-arm64.zip.sha256
 ```
 
 別バージョンではファイル名を読み替えます。
@@ -41,6 +41,8 @@ chezmoi diff
 ```
 
 この例は `--apply` を付けていません。差分を確認し、環境固有の設定や復号設定を整えます。Chezmoi Menu のアプリ用リポジトリを dotfiles として初期化しないでください。
+
+`encrypted_private_dot_env.age` などの暗号化ファイルを使う場合は、この Mac にも age 秘密鍵と chezmoi の暗号化設定が必要です。アプリはそれらを別の Mac からコピーしません。[暗号化した `~/.env` の共有](USAGE.md#暗号化した-env-の共有)を参照してください。
 
 現在のブランチには upstream が必要です。chezmoi の `git.autoAdd` / `git.autoCommit` / `git.autoPush` は無効にします。詳しくは [使い方](USAGE.md) を参照してください。
 

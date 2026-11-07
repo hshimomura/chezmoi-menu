@@ -1,7 +1,7 @@
 import Foundation
 
 public enum SyncPhase: String, Sendable, Codable {
-    case preparing, checking, fetching, backingUp, capturing, merging, resolving, validating, applying, pushing, previewing, cleaningUp, finished
+    case preparing, checking, fetching, backingUp, capturing, committing, merging, resolving, validating, applying, pushing, previewing, cleaningUp, finished
 
     public var title: String {
         switch self {
@@ -10,6 +10,7 @@ public enum SyncPhase: String, Sendable, Codable {
         case .fetching: "取得"
         case .backingUp: "バックアップ"
         case .capturing: "変更の取り込み"
+        case .committing: "コミット"
         case .merging: "統合"
         case .resolving: "AI 競合解決"
         case .validating: "検証"
@@ -27,7 +28,7 @@ public enum SyncPhase: String, Sendable, Codable {
         case .checking, .previewing: 0.12
         case .fetching: 0.18
         case .backingUp: 0.28
-        case .capturing: 0.38
+        case .capturing, .committing: 0.38
         case .merging: 0.48
         case .resolving: 0.6
         case .validating: 0.74
@@ -46,7 +47,21 @@ public struct SyncEvent: Sendable {
 
 public struct DiffPreview: Sendable {
     public let files: [String]
-    public let omittedCount: Int
+    public let omittedFiles: [String]
+    public var omittedCount: Int { omittedFiles.count }
     public let text: String
     public let truncated: Bool
+}
+
+public struct SourcePreview: Sendable {
+    public let uncommitted: DiffPreview
+    public let upstream: DiffPreview?
+    public let ahead: Int
+    public let behind: Int
+}
+
+public struct SourceCommitReport: Sendable {
+    public let backup: URL
+    public let commit: String
+    public let preview: SourcePreview
 }

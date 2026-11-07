@@ -6,6 +6,8 @@ macOS のメニューバーから [chezmoi](https://www.chezmoi.io/) を Downloa
 
 **chezmoi の非公式クライアントです。** dotfiles の管理には、別途インストールした chezmoi と既存の Git リポジトリを使用します。ホーム全体を自動で Git 管理する機能はありません。
 
+現在のソースバージョンは **0.3.0** です。[変更内容](docs/releases/v0.3.0.md)を参照してください。
+
 ## できること
 
 | 操作 | 動作 |
@@ -14,7 +16,8 @@ macOS のメニューバーから [chezmoi](https://www.chezmoi.io/) を Downloa
 | Upload 同期 | ローカル変更とリモートを統合・適用し、upstream に push |
 | 同期前チェック | Git 接続・差分・現在の source の適用予行を確認。実適用・commit・push・AI 通信はしません |
 | AI 競合解決 | 共通祖先・ローカル・リモートの 3 つの版からテキストを統合 |
-| 差分表示 | 現在の source と Mac の差分・変更ファイルを表示。除外対象は非表示 |
+| 差分表示 | source の未コミット変更、コミット済みと upstream の差分、Mac と source の差分を切り替え。暗号化・除外対象は名前のみ表示 |
+| source のコミット | メッセージを指定して source の変更をまとめてコミットし、upstream との差分を確認 |
 | 停止 | 通信・AI 待機を中断。commit・merge・apply・push は完了を待って停止 |
 | ショートカット | Download / Upload / 同期前チェックを macOS「ショートカット」から実行 |
 

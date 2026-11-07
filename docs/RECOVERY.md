@@ -6,11 +6,11 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| `source/` | 同期前の source 全体と `.git`。未コミット変更を含む |
+| `source/` | 同期または GUI コミット前の source 全体と `.git`。未コミット変更を含む |
 | `destination.json` | 元パス、コピー先、存在、種類、権限の対応表 |
 | `destination/` | 管理対象のファイルとリンク。数字の名前は対応表で照合する |
-| `original-head.txt` | 同期前の HEAD |
-| `captured-head.txt` | Mac 側の編集をコミットした直後の HEAD |
+| `original-head.txt` | 同期または GUI コミット前の HEAD |
+| `captured-head.txt` | 同期時に Mac 側の編集をコミットした直後の HEAD。GUI の source コミットでは作成しない |
 | `external-source-edits/` | AI 解決中に source の競合ファイルが再編集されたとき、その編集内容を退避 |
 
 バックアップには平文の dotfiles や秘密情報が含まれます。親ディレクトリは所有ユーザーだけがアクセスできる権限にします。共有や公開は避けてください。自動削除しないため、不要なものは利用者が削除してください。

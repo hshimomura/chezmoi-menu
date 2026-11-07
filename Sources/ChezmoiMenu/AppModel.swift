@@ -3,7 +3,9 @@ import Observation
 import ServiceManagement
 import ChezmoiCore
 
-enum AppOperation: Sendable { case download, upload, check, preview }
+enum AppOperation: Sendable, Equatable {
+    case download, upload, check, preview, sourcePreview, commitSource(String)
+}
 
 enum SettingsSection: String, CaseIterable, Identifiable {
     case overview = "同期", diff = "差分", general = "一般", ai = "OpenAI", history = "実行履歴"
@@ -30,6 +32,8 @@ final class AppModel {
     private(set) var phase: SyncPhase = .preparing
     private(set) var history: [String] = []
     private(set) var preview: DiffPreview?
+    private(set) var sourcePreview: SourcePreview?
+    private(set) var lastSourceCommit: String?
     private(set) var checkReport: SyncCheckReport?
     private(set) var lastBackup: URL?
     var notice = ""
@@ -101,7 +105,7 @@ final class AppModel {
         activeID = id
         running = true; stopping = false; notice = ""; phase = .preparing
         status = "準備しています…"
-        if operation != .preview { preview = nil; checkReport = nil }
+        if operation != .preview && operation != .sourcePreview { preview = nil; checkReport = nil }
         let engine = SyncEngine(settings: saved, backups: backups, resolver: KeychainResolver(model: saved.model),
                                 onEvent: { [weak self] event in
             Task { @MainActor in
@@ -115,6 +119,7 @@ final class AppModel {
             do {
                 switch operation {
                 case .download, .upload:
+                    sourcePreview = nil
                     let result = try await engine.sync(operation == .download ? .download : .upload)
                     lastBackup = result.backup
                     record("バックアップ: \(result.backup.lastPathComponent)")
@@ -130,7 +135,19 @@ final class AppModel {
                     preview = nil
                     let result = try await engine.preview()
                     preview = result
-                    status = "差分の確認完了 · 表示対象 \(result.files.count) 件"
+                    status = "差分の確認完了 · 内容表示 \(result.files.count) 件 · 内容非表示 \(result.omittedCount) 件"
+                case .sourcePreview:
+                    sourcePreview = nil
+                    sourcePreview = try await engine.sourcePreview()
+                    status = "source の差分を更新しました。"
+                case .commitSource(let message):
+                    sourcePreview = nil
+                    let result = try await engine.commitSource(message: message)
+                    lastBackup = result.backup
+                    sourcePreview = result.preview
+                    lastSourceCommit = result.commit
+                    status = "コミット \(result.commit) を作成しました。"
+                    notice = "コミット済みの差分を確認できます。リモートへ送信する場合は Upload を実行してください。"
                 }
                 phase = .finished
                 record(status)

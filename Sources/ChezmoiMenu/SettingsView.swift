@@ -1,7 +1,17 @@
 import SwiftUI
+import ChezmoiCore
+
+private enum DiffMode: String, CaseIterable, Identifiable {
+    case uncommitted = "未コミット"
+    case upstream = "コミット済み ↔ upstream"
+    case destination = "Mac ↔ source"
+    var id: Self { self }
+}
 
 struct SettingsView: View {
     @Bindable var model: AppModel
+    @State private var diffMode = DiffMode.uncommitted
+    @State private var commitMessage = "Update dotfiles"
     var body: some View {
         NavigationSplitView {
             List(SettingsSection.allCases, selection: $model.section) { section in
@@ -13,6 +23,8 @@ struct SettingsView: View {
                     Image(nsImage: BrandIcon.application).resizable().frame(width: 32, height: 32)
                     VStack(alignment: .leading) {
                         Text("Chezmoi Menu").font(.caption.bold())
+                        Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+                             ?? "開発ビルド").font(.caption2).foregroundStyle(.secondary)
                         Text("macOS 27 · Apple Silicon").font(.caption2).foregroundStyle(.secondary)
                     }
                 }.padding()
@@ -96,7 +108,7 @@ struct SettingsView: View {
             Section("除外パス（部分一致・1 行に 1 件）") {
                 TextEditor(text: $model.settings.excludedAIPaths)
                     .font(.system(.body, design: .monospaced)).frame(minHeight: 150)
-                Text("この除外設定は差分表示にも使用します。暗号化ファイルは設定にかかわらず除外します。")
+                Text("この除外設定は差分の内容表示にも使用します。暗号化ファイルの内容は設定にかかわらず非表示です。通常の同期には含まれます。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Button("設定を保存") { model.save() }.buttonStyle(.glassProminent)
@@ -106,23 +118,51 @@ struct SettingsView: View {
     private var diff: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Mac ↔ 現在の source").font(.headline)
+                Text("変更とコミット").font(.headline)
                 Spacer()
-                Button("差分を更新", systemImage: "arrow.clockwise") { model.start(.preview) }.disabled(model.running)
+                Button("差分を更新", systemImage: "arrow.clockwise") { refreshDiff() }.disabled(model.running)
             }
-            Text("リモートの取得前の差分です。除外パス・暗号化ファイルは表示しません。内容は保存せず、この画面だけで表示します。")
+            Picker("比較対象", selection: $diffMode) {
+                ForEach(DiffMode.allCases) { Text($0.rawValue).tag($0) }
+            }.pickerStyle(.segmented).disabled(model.running)
+            Text(diffDescription).font(.caption).foregroundStyle(.secondary)
+            Text("暗号化ファイル・除外パスは名前のみ表示します。通常の同期・コミットには含まれます。")
                 .font(.caption).foregroundStyle(.secondary)
-            if let preview = model.preview {
-                Text("表示対象 \(preview.files.count) 件 · 除外 \(preview.omittedCount) 件\(preview.truncated ? " · 先頭 100,000 文字のみ" : "")")
+            if diffMode == .uncommitted {
+                HStack {
+                    TextField("コミットメッセージ", text: $commitMessage)
+                        .textFieldStyle(.roundedBorder)
+                    Button("source をコミット", systemImage: "checkmark.circle") {
+                        model.start(.commitSource(commitMessage))
+                    }.buttonStyle(.glassProminent)
+                        .disabled(model.running || commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || currentDiff.map { $0.files.isEmpty && $0.omittedFiles.isEmpty } != false)
+                }.disabled(model.running)
+            }
+            if diffMode == .upstream, let source = model.sourcePreview {
+                Text(source.upstream == nil ? "upstream が未設定です。" : "upstream より \(source.ahead) コミット先行 · \(source.behind) コミット遅延")
                     .font(.caption).foregroundStyle(.secondary)
-                if preview.files.isEmpty {
-                    ContentUnavailableView("表示対象の差分はありません", systemImage: "checkmark.circle")
+            }
+            if let preview = currentDiff {
+                Text("内容表示 \(preview.files.count) 件 · 内容非表示 \(preview.omittedCount) 件\(preview.truncated ? " · 先頭 100,000 文字のみ" : "")")
+                    .font(.caption).foregroundStyle(.secondary)
+                if preview.files.isEmpty && preview.omittedFiles.isEmpty {
+                    ContentUnavailableView("差分はありません", systemImage: "checkmark.circle")
                 } else {
                     ScrollView([.vertical, .horizontal]) {
                         VStack(alignment: .leading, spacing: 18) {
-                            Text(preview.files.joined(separator: "\n")).foregroundStyle(.secondary)
-                            Divider()
-                            Text(preview.text.isEmpty ? "内容の差分はありません。" : preview.text)
+                            if !preview.files.isEmpty {
+                                Text(preview.files.joined(separator: "\n")).foregroundStyle(.secondary)
+                                Divider()
+                                Text(preview.text.isEmpty ? "内容の差分はありません。" : preview.text)
+                            }
+                            if !preview.omittedFiles.isEmpty {
+                                Label("内容を表示しない変更", systemImage: "lock.doc")
+                                    .font(.headline)
+                                Text("暗号化ファイルまたは除外パスのため、内容を非表示にしています。競合した場合は手動で解決してください。")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                Text(preview.omittedFiles.joined(separator: "\n"))
+                            }
                         }.font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading).padding()
                     }.background(.quaternary.opacity(0.3), in: .rect(cornerRadius: 10))
@@ -133,6 +173,31 @@ struct SettingsView: View {
             }
             if model.running { OperationStatus(model: model) }
         }.padding(24)
+            .task {
+                if model.sourcePreview == nil && !model.running { refreshDiff() }
+            }
+            .onChange(of: diffMode) { if !model.running { refreshDiff() } }
+            .onChange(of: model.lastSourceCommit) { diffMode = .upstream }
+    }
+
+    private var currentDiff: DiffPreview? {
+        switch diffMode {
+        case .uncommitted: model.sourcePreview?.uncommitted
+        case .upstream: model.sourcePreview?.upstream
+        case .destination: model.preview
+        }
+    }
+
+    private var diffDescription: String {
+        switch diffMode {
+        case .uncommitted: "source と直前のコミットを比較します。ステージ済み・未ステージ・新規ファイルを含む source の変更をすべてコミットします。"
+        case .upstream: "取得済みの upstream と現在のコミットを比較します。リモートの最新状態は同期時に取得します。送信する場合は Upload を実行してください。"
+        case .destination: "Mac と現在の source を比較します。source に反映済みの未コミット変更は、この比較には表示されません。"
+        }
+    }
+
+    private func refreshDiff() {
+        model.start(diffMode == .destination ? .preview : .sourcePreview)
     }
 
     private var history: some View {

@@ -290,24 +290,21 @@ public actor SyncEngine {
         }
         let status = try await chez(["status", "--exclude=scripts", "--path-style=absolute"]).text
         var eligible: [String] = []
-        var omitted = 0
+        var omitted: [String] = []
         for line in status.split(separator: "\n") {
             try Task.checkCancellation()
             guard line.count >= 4, Array(line.prefix(3))[2] == " " else { throw SyncError("status の形式を確認できません。") }
             let target = String(line.dropFirst(3))
             guard target.hasPrefix(destination + "/"), !target.contains("\r") else { throw SyncError("差分のパスを確認できません。") }
             let path = try await chez(["source-path", "--", target]).text.trimmingCharacters(in: .newlines)
-            let patterns = settings.excludedAIPaths.split(whereSeparator: \.isNewline)
-                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
-            let excluded = patterns.contains { path.lowercased().contains($0) }
-                || path.split(separator: "/").contains { $0.hasPrefix("encrypted_") }
-            if excluded { omitted += 1 } else { eligible.append(target) }
+            if isContentExcluded(path) { omitted.append(String(target.dropFirst(destination.count + 1))) }
+            else { eligible.append(target) }
         }
         // An empty target list would mean "all files" to chezmoi.
         let text = eligible.isEmpty ? "" : try await chez(["diff", "--exclude=scripts,encrypted", "--"] + eligible).text
         let limit = 100_000
         return DiffPreview(files: eligible.map { String($0.dropFirst(destination.count + 1)) },
-                           omittedCount: omitted, text: String(text.prefix(limit)), truncated: text.count > limit)
+                           omittedFiles: omitted, text: String(text.prefix(limit)), truncated: text.count > limit)
     }
 
     private func changedDestinations(source: URL, destination: URL) async throws -> [String] {
@@ -340,10 +337,8 @@ public actor SyncEngine {
     }
 
     private func readConflict(_ path: String, source: URL) async throws -> Conflict {
-        let patterns = settings.excludedAIPaths.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
         guard !path.hasPrefix("/"), !path.split(separator: "/").contains(".."),
-              !patterns.contains(where: { path.lowercased().contains($0) }),
-              !path.split(separator: "/").contains(where: { $0.hasPrefix("encrypted_") }) else {
+              !isContentExcluded(path) else {
             throw SyncError("AI 送信の除外対象に競合があります。手動で解決してください。")
         }
         let stages = try await git(["ls-files", "--stage", "--", path], source).text.split(separator: "\n")
@@ -422,5 +417,133 @@ public actor SyncEngine {
 
     private func managedPaths() async throws -> [String] {
         try await chez(["managed", "--include=files,symlinks", "--path-style=absolute", "--nul-path-separator"]).text.split(separator: "\0").map(String.init)
+    }
+}
+
+extension SyncEngine {
+    private func isContentExcluded(_ path: String) -> Bool {
+        let patterns = settings.excludedAIPaths.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+        return patterns.contains { path.lowercased().contains($0) }
+            || path.split(separator: "/").contains { $0.hasPrefix("encrypted_") }
+    }
+
+    // Source Git operations are local: no fetch, re-add, merge, apply, push or AI.
+    public func sourcePreview() async throws -> SourcePreview {
+        try beginOperation()
+        defer { operationInProgress = false }
+        report(.previewing, "source の未コミット変更と upstream との差分を確認しています…")
+        let context = try await sourceContext()
+        return try await readSourcePreview(context.source)
+    }
+
+    public func commitSource(message: String) async throws -> SourceCommitReport {
+        try beginOperation()
+        defer { operationInProgress = false }
+        let message = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { throw SyncError("コミットメッセージを入力してください。") }
+        let context = try await sourceContext()
+        let source = context.source
+        let lock = open(source.appendingPathComponent(".git/chezmoi-menu.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard lock >= 0 else { throw SyncError("同期用のロックを取得できません。") }
+        defer { close(lock) }
+        guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw SyncError("別の Chezmoi Menu が操作しています。完了を待ってください。") }
+        defer { flock(lock, LOCK_UN) }
+        try validateSourceIdle(source)
+        let status = try await git(["status", "--porcelain", "-z"], source).data
+        guard !status.isEmpty else { throw SyncError("source に未コミット変更はありません。") }
+        let head = try await git(["rev-parse", "HEAD"], source).text.trimmingCharacters(in: .whitespacesAndNewlines)
+        report(.backingUp, "コミット前の状態をバックアップしています…")
+        let backup = try await makeBackup(source: source, destination: context.destination, head: head)
+        report(.backingUp, "バックアップ: \(backup.lastPathComponent)")
+        report(.committing, "source の変更をコミットしています…")
+        try await git(["add", "--all"], source)
+        let changed = try await git(["diff", "--cached", "--quiet"], source, allowFailure: true)
+        guard changed.code == 1 else { throw SyncError("コミットできる変更がありません。source と Git index を確認してください。") }
+        try await git(["commit", "-m", message], source)
+        let commit = try await git(["rev-parse", "--short", "HEAD"], source).text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = try await readSourcePreview(source)
+        report(.finished, "コミット \(commit) を作成しました。")
+        return SourceCommitReport(backup: backup, commit: commit, preview: preview)
+    }
+
+    private func sourceContext() async throws -> (source: URL, destination: URL) {
+        let config = try JSONSerialization.jsonObject(with: await chez(["dump-config", "--format=json"]).data) as? [String: Any] ?? [:]
+        guard let sourcePath = config["sourceDir"] as? String, let destinationPath = config["destDir"] as? String,
+              (config["hooks"] as? [String: Any] ?? [:]).isEmpty else {
+            throw SyncError("hooks のない chezmoi の source / destination 設定が必要です。")
+        }
+        let gitConfig = config["git"] as? [String: Any] ?? [:]
+        guard !["autoadd", "autocommit", "autopush", "autoAdd", "autoCommit", "autoPush"].contains(where: { gitConfig[$0] as? Bool == true }) else {
+            throw SyncError("chezmoi の Git 自動処理を無効にしてから操作してください。")
+        }
+        let source = URL(fileURLWithPath: sourcePath).resolvingSymlinksInPath()
+        let root = try await git(["rev-parse", "--show-toplevel"], source).text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard source.path == URL(fileURLWithPath: root).resolvingSymlinksInPath().path,
+              (try? fm.attributesOfItem(atPath: source.appendingPathComponent(".git").path)[.type] as? FileAttributeType) == .typeDirectory else {
+            throw SyncError("source が Git ルートと一致する通常のリポジトリが必要です。")
+        }
+        try validateSourceIdle(source)
+        return (source, URL(fileURLWithPath: destinationPath).resolvingSymlinksInPath())
+    }
+
+    private func validateSourceIdle(_ source: URL) throws {
+        for marker in ["MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_START", "index.lock", "chezmoi-menu-pending-apply.json"] {
+            guard !fm.fileExists(atPath: source.appendingPathComponent(".git/" + marker).path) else {
+                throw SyncError("進行中または未完了の Git / apply 操作があります。先に完了または中止してください。")
+            }
+        }
+        guard !fm.fileExists(atPath: source.appendingPathComponent(".gitmodules").path) else {
+            throw SyncError("submodule を含むリポジトリは対象外です。")
+        }
+    }
+
+    private func readSourcePreview(_ source: URL) async throws -> SourcePreview {
+        let modified = try await git(["diff", "--no-renames", "--name-only", "-z", "HEAD", "--"], source).text
+            .split(separator: "\0").map(String.init)
+        let untracked = try await git(["ls-files", "--others", "--exclude-standard", "-z"], source).text
+            .split(separator: "\0").map(String.init)
+        let uncommitted = try await sourceDiff(source, paths: Array(Set(modified + untracked)).sorted(),
+                                                revisions: ["HEAD"], untracked: Set(untracked))
+        let upstreamRef = try await git(["rev-parse", "--verify", "@{upstream}"], source, allowFailure: true)
+        guard upstreamRef.code == 0 else {
+            return SourcePreview(uncommitted: uncommitted, upstream: nil, ahead: 0, behind: 0)
+        }
+        let upstreamHead = upstreamRef.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let counts = try await git(["rev-list", "--left-right", "--count", "\(upstreamHead)...HEAD"], source).text
+            .split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+        guard counts.count == 2 else { throw SyncError("upstream との差分件数を確認できません。") }
+        let paths = try await git(["diff", "--no-renames", "--name-only", "-z", upstreamHead, "HEAD", "--"], source).text
+            .split(separator: "\0").map(String.init)
+        let upstream = try await sourceDiff(source, paths: paths, revisions: [upstreamHead, "HEAD"])
+        return SourcePreview(uncommitted: uncommitted, upstream: upstream, ahead: counts[1], behind: counts[0])
+    }
+
+    private func sourceDiff(_ source: URL, paths: [String], revisions: [String],
+                            untracked: Set<String> = []) async throws -> DiffPreview {
+        let omitted = paths.filter(isContentExcluded)
+        let eligible = paths.filter { !isContentExcluded($0) }
+        var text = ""
+        let limit = 100_000
+        var truncated = false
+        // Disable external diff drivers and text conversions; use literal pathspecs.
+        let flags = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color"]
+        for path in eligible {
+            try Task.checkCancellation()
+            guard text.count < limit else { truncated = true; break }
+            let result: CommandResult
+            if untracked.contains(path) {
+                let file = source.appendingPathComponent(path)
+                guard (try? fm.attributesOfItem(atPath: file.path)[.type] as? FileAttributeType) == .typeRegular else { continue }
+                result = try await git(flags + ["--no-index", "--", "/dev/null", file.path], source, allowFailure: true)
+                guard result.code == 0 || result.code == 1 else { throw SyncError("未管理ファイルの差分を確認できません。") }
+            } else {
+                result = try await git(flags + revisions + ["--", ":(literal)" + path], source)
+            }
+            let remaining = limit - text.count
+            truncated = truncated || result.text.count > remaining
+            text += result.text.prefix(remaining)
+        }
+        return DiffPreview(files: eligible, omittedFiles: omitted, text: text, truncated: truncated)
     }
 }
