@@ -1,7 +1,7 @@
 import Foundation
 
 public enum SyncPhase: String, Sendable, Codable {
-    case preparing, checking, fetching, backingUp, capturing, committing, merging, resolving, validating, applying, pushing, previewing, cleaningUp, finished
+    case preparing, checking, fetching, backingUp, capturing, committing, merging, choosing, resolving, validating, applying, pushing, previewing, cleaningUp, finished
 
     public var title: String {
         switch self {
@@ -12,6 +12,7 @@ public enum SyncPhase: String, Sendable, Codable {
         case .capturing: "変更の取り込み"
         case .committing: "コミット"
         case .merging: "統合"
+        case .choosing: "競合する版の選択"
         case .resolving: "AI 競合解決"
         case .validating: "検証"
         case .applying: "適用"
@@ -29,7 +30,7 @@ public enum SyncPhase: String, Sendable, Codable {
         case .fetching: 0.18
         case .backingUp: 0.28
         case .capturing, .committing: 0.38
-        case .merging: 0.48
+        case .merging, .choosing: 0.48
         case .resolving: 0.6
         case .validating: 0.74
         case .applying: 0.86
@@ -65,3 +66,21 @@ public struct SourceCommitReport: Sendable {
     public let commit: String
     public let preview: SourcePreview
 }
+
+public enum ConflictSide: String, Sendable { case local, remote }
+
+public struct SelectableConflict: Sendable {
+    public let path: String
+    public let localDeleted: Bool
+    public let remoteDeleted: Bool
+}
+
+public struct ConflictSelectionRequest: Identifiable, Sendable {
+    public let id = UUID()
+    public let conflicts: [SelectableConflict]
+    public let localHead: String
+    public let remoteHead: String
+    public let direction: SyncDirection
+}
+
+public typealias ConflictSelecting = @Sendable (ConflictSelectionRequest) async throws -> [String: ConflictSide]

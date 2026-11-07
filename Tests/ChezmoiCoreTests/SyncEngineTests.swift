@@ -31,6 +31,22 @@ private actor WaitingResolver: ConflictResolving {
     }
 }
 
+private actor WaitingConflictSelection {
+    private var entered = false
+    func choose(_ request: ConflictSelectionRequest) async throws -> [String: ConflictSide] {
+        entered = true
+        try await Task.sleep(for: .seconds(30))
+        throw SyncError("selection should have been cancelled")
+    }
+    func waitUntilEntered() async throws {
+        for _ in 0..<500 {
+            if entered { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw SyncError("selection did not start")
+    }
+}
+
 private struct EditingResolver: ConflictResolving {
     let target: URL
     func resolve(_ conflict: Conflict) async throws -> Resolution {
@@ -135,8 +151,8 @@ private final class Fixture {
     }
     func writeTarget(_ text: String) throws { try text.write(to: target, atomically: true, encoding: .utf8) }
     func targetContent() throws -> String { try String(contentsOf: target, encoding: .utf8) }
-    func engine(resolver: (any ConflictResolving)? = nil) -> SyncEngine {
-        SyncEngine(settings: settings, backups: backups, resolver: resolver)
+    func engine(resolver: (any ConflictResolving)? = nil, chooseConflicts: ConflictSelecting? = nil) -> SyncEngine {
+        SyncEngine(settings: settings, backups: backups, resolver: resolver, chooseConflicts: chooseConflicts)
     }
     func assertNoMerge() throws {
         XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathComponent(".git/MERGE_HEAD").path))
@@ -146,6 +162,233 @@ private final class Fixture {
 
 @MainActor
 final class SyncEngineTests: XCTestCase {
+    func testConflictSelectionExternalIndexChangeIsPreservedWithoutAbortingOtherWork() async throws {
+        for cancelSelection in [false, true] {
+            let f = try Fixture(filename: "dot_env")
+            try f.writeTarget("value=local\n")
+            try f.remoteChange("value=remote\n")
+            let source = f.source
+            let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+            do {
+                _ = try await f.engine(chooseConflicts: { request in
+                    try "value=external-index-edit\n".write(to: source.appendingPathComponent("dot_env"), atomically: true, encoding: .utf8)
+                    try FixtureCommand().run("/usr/bin/git", ["add", "--", "dot_env"], directory: source)
+                    if cancelSelection { throw CancellationError() }
+                    return [request.conflicts[0].path: .remote]
+                }).sync(.upload)
+                XCTFail("external index edit ignored")
+            } catch { XCTAssertTrue(error.localizedDescription.contains("Git の状態が変更")) }
+            XCTAssertEqual(try String(contentsOf: source.appendingPathComponent("dot_env"), encoding: .utf8), "value=external-index-edit\n")
+            XCTAssertEqual(try f.git(["show", ":0:dot_env"]).text, "value=external-index-edit\n")
+            XCTAssertEqual(try f.targetContent(), "value=local\n")
+            XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent(".git/MERGE_HEAD").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        }
+    }
+
+    func testConflictSelectionCancellationAbortsMergeAndPreservesLocalEnv() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        let waiting = WaitingConflictSelection()
+        let engine = f.engine(chooseConflicts: { try await waiting.choose($0) })
+        let task = Task { try await engine.sync(.upload) }
+        try await waiting.waitUntilEntered()
+        do { _ = try await engine.sourcePreview(); XCTFail("concurrent operation accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("別の操作")) }
+        task.cancel()
+        do { _ = try await task.value; XCTFail("cancellation ignored") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionSourceEditIsBackedUpAndNotOverwritten() async throws {
+        let f = try Fixture(filename: "dot_env")
+        try "other=base\n".write(to: f.source.appendingPathComponent("private_dot_other"), atomically: true, encoding: .utf8)
+        try f.git(["add", "--all"])
+        try f.git(["commit", "-m", "add second conflict file"])
+        try f.git(["push"])
+        try f.git(["pull", "--ff-only"], at: f.other)
+        try f.chez(["apply", "--force"])
+        try f.writeTarget("value=local\n")
+        try "other=local\n".write(to: f.home.appendingPathComponent(".other"), atomically: true, encoding: .utf8)
+        try "other=remote\n".write(to: f.other.appendingPathComponent("private_dot_other"), atomically: true, encoding: .utf8)
+        try f.remoteChange("value=remote\n")
+        let sourceFile = f.source.appendingPathComponent("dot_env")
+        let otherFile = f.source.appendingPathComponent("private_dot_other")
+        do {
+            _ = try await f.engine(chooseConflicts: { request in
+                try "value=edited-while-choosing\n".write(to: sourceFile, atomically: true, encoding: .utf8)
+                try "other=edited-while-choosing\n".write(to: otherFile, atomically: true, encoding: .utf8)
+                return Dictionary(uniqueKeysWithValues: request.conflicts.map { ($0.path, .remote) })
+            }).sync(.upload)
+            XCTFail("source edit ignored")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("選択中に source")) }
+        let backup = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: f.backups, includingPropertiesForKeys: nil).first)
+        XCTAssertEqual(try String(contentsOf: backup.appendingPathComponent("external-source-edits/dot_env"), encoding: .utf8), "value=edited-while-choosing\n")
+        XCTAssertEqual(try String(contentsOf: backup.appendingPathComponent("external-source-edits/private_dot_other"), encoding: .utf8), "other=edited-while-choosing\n")
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionDestinationEditBlocksApplyAndPush() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let target = f.target
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        do {
+            _ = try await f.engine(chooseConflicts: { request in
+                try "value=edited-while-choosing\n".write(to: target, atomically: true, encoding: .utf8)
+                return [request.conflicts[0].path: .remote]
+            }).sync(.upload)
+            XCTFail("destination edit ignored")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("同期中")) }
+        XCTAssertEqual(try f.targetContent(), "value=edited-while-choosing\n")
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: f.source.appendingPathComponent(".git/chezmoi-menu-pending-apply.json").path))
+    }
+
+    func testConflictSelectionOrdinaryFileCanChooseRemoteWithAIDisabled() async throws {
+        let f = try Fixture()
+        f.settings.autoResolve = false
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let report = try await f.engine(chooseConflicts: { request in
+            XCTAssertEqual(request.conflicts.map(\.path), ["dot_test"])
+            return ["dot_test": .remote]
+        }).sync(.download)
+        XCTAssertEqual(report.selectedCount, 1)
+        XCTAssertEqual(report.resolvedCount, 0)
+        XCTAssertEqual(try f.targetContent(), "value=remote\n")
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionLocalEncryptedEnvUploadsAndPreservesRemoteChanges() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        try "remote-only\n".write(to: f.other.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try f.git(["add", "README.md"], at: f.other)
+        try f.git(["commit", "-m", "remote unrelated file"], at: f.other)
+        try f.git(["push"], at: f.other)
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text.trimmingCharacters(in: .newlines)
+        let engine = f.engine(resolver: FailingResolver(), chooseConflicts: { request in
+            XCTAssertEqual(request.conflicts.map(\.path), ["encrypted_private_dot_env.age"])
+            XCTAssertEqual(request.remoteHead, remoteBefore)
+            XCTAssertEqual(request.direction, .upload)
+            XCTAssertFalse(request.conflicts[0].localDeleted)
+            XCTAssertFalse(request.conflicts[0].remoteDeleted)
+            return [request.conflicts[0].path: .local]
+        })
+        let report = try await engine.sync(.upload)
+        XCTAssertEqual(report.selectedCount, 1)
+        XCTAssertEqual(report.resolvedCount, 0)
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try f.git(["show", "HEAD:README.md"]).text, "remote-only\n")
+        XCTAssertEqual(try f.git(["show", "HEAD:README.md"], at: f.remote).text, "remote-only\n")
+        XCTAssertEqual(try f.git(["rev-list", "--parents", "-n", "1", "HEAD"]).text.split(whereSeparator: \.isWhitespace).count, 3)
+        XCTAssertEqual(try f.git(["merge-base", "--is-ancestor", remoteBefore, "HEAD"]).code, 0)
+        XCTAssertEqual(try String(contentsOf: report.backup.appendingPathComponent("destination/0"), encoding: .utf8), "value=local\n")
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionRemoteEncryptedEnvDownloadsWithoutAIOrPush() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        f.settings.autoResolve = false
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        let report = try await f.engine(chooseConflicts: { request in
+            XCTAssertEqual(request.direction, .download)
+            return Dictionary(uniqueKeysWithValues: request.conflicts.map { ($0.path, .remote) })
+        }).sync(.download)
+        XCTAssertEqual(try f.targetContent(), "value=remote\n")
+        XCTAssertEqual(report.selectedCount, 1)
+        XCTAssertEqual(report.resolvedCount, 0)
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionCanMixLocalAndRemoteAcrossMultipleFiles() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try "other=base\n".write(to: f.source.appendingPathComponent("private_dot_other"), atomically: true, encoding: .utf8)
+        try f.git(["add", "--all"])
+        try f.git(["commit", "-m", "add second private file"])
+        try f.git(["push"])
+        try f.git(["pull", "--ff-only"], at: f.other)
+        try f.chez(["apply", "--force"])
+        try f.writeTarget("value=local\n")
+        try "other=local\n".write(to: f.home.appendingPathComponent(".other"), atomically: true, encoding: .utf8)
+        try "other=remote\n".write(to: f.other.appendingPathComponent("private_dot_other"), atomically: true, encoding: .utf8)
+        try f.remoteChange("value=remote\n")
+        let report = try await f.engine(resolver: FailingResolver(), chooseConflicts: { request in
+            XCTAssertEqual(Set(request.conflicts.map(\.path)), ["encrypted_private_dot_env.age", "private_dot_other"])
+            return ["encrypted_private_dot_env.age": .remote, "private_dot_other": .local]
+        }).sync(.upload)
+        XCTAssertEqual(report.selectedCount, 2)
+        XCTAssertEqual(try f.targetContent(), "value=remote\n")
+        XCTAssertEqual(try String(contentsOf: f.home.appendingPathComponent(".other"), encoding: .utf8), "other=local\n")
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionMissingChoicesAbortsMergeWithoutPush() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        try f.remoteChange("value=remote\n")
+        let remoteBefore = try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text
+        do { _ = try await f.engine(chooseConflicts: { _ in [:] }).sync(.upload); XCTFail("missing choices accepted") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("すべての競合")) }
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        XCTAssertEqual(try f.git(["rev-parse", "refs/heads/main"], at: f.remote).text, remoteBefore)
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionRemoteDeletionRemovesEncryptedEnv() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try f.writeTarget("value=local\n")
+        try f.git(["rm", "encrypted_private_dot_env.age"], at: f.other)
+        try f.git(["commit", "-m", "remove encrypted env"], at: f.other)
+        try f.git(["push"], at: f.other)
+        let report = try await f.engine(chooseConflicts: { request in
+            XCTAssertTrue(request.conflicts[0].remoteDeleted)
+            return ["encrypted_private_dot_env.age": .remote]
+        }).sync(.download)
+        XCTAssertEqual(report.selectedCount, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.source.appendingPathComponent("encrypted_private_dot_env.age").path))
+        // chezmoi does not remove a destination simply because it was forgotten from source.
+        XCTAssertEqual(try f.targetContent(), "value=local\n")
+        try f.assertNoMerge()
+    }
+
+    func testConflictSelectionMixedWithAIResolvesEachOnlyOnce() async throws {
+        let f = try Fixture(encryptedEnv: true)
+        try "value=base\n".write(to: f.source.appendingPathComponent("dot_test"), atomically: true, encoding: .utf8)
+        try f.git(["add", "--all"])
+        try f.git(["commit", "-m", "add ordinary file"])
+        try f.git(["push"])
+        try f.git(["pull", "--ff-only"], at: f.other)
+        try f.chez(["apply", "--force"])
+        try f.writeTarget("value=local\n")
+        try "value=local\n".write(to: f.home.appendingPathComponent(".test"), atomically: true, encoding: .utf8)
+        try "value=remote\n".write(to: f.other.appendingPathComponent("dot_test"), atomically: true, encoding: .utf8)
+        try f.remoteChange("value=remote\n")
+        let report = try await f.engine(resolver: FixedResolver(content: "value=merged\n"), chooseConflicts: { request in
+            XCTAssertEqual(request.conflicts.map(\.path), ["encrypted_private_dot_env.age"])
+            return ["encrypted_private_dot_env.age": .remote]
+        }).sync(.upload)
+        XCTAssertEqual(report.selectedCount, 1)
+        XCTAssertEqual(report.resolvedCount, 1)
+        XCTAssertEqual(try f.targetContent(), "value=remote\n")
+        XCTAssertEqual(try String(contentsOf: f.home.appendingPathComponent(".test"), encoding: .utf8), "value=merged\n")
+        try f.assertNoMerge()
+    }
+
     func testMultipleSourceFilesWithEncryptedEnvCommitAllChanges() async throws {
         let f = try Fixture(encryptedEnv: true)
         let initial = ["dot_alpha": "alpha=base\n", "dot_deleted": "deleted=base\n",

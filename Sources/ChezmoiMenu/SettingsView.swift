@@ -47,6 +47,13 @@ struct SettingsView: View {
                 }
             }.navigationTitle(model.section.rawValue)
         }.frame(minWidth: 720, minHeight: 560)
+            .sheet(item: Binding(get: { model.conflictSelection }, set: { value in
+                if value == nil && model.conflictSelection != nil { model.cancel() }
+            })) { request in
+                ConflictSelectionView(request: request, onSelect: {
+                    model.selectConflictVersions($0, requestID: request.id)
+                }, onCancel: { model.cancel() })
+            }
     }
 
     private var overview: some View {
@@ -159,7 +166,7 @@ struct SettingsView: View {
                             if !preview.omittedFiles.isEmpty {
                                 Label("内容を表示しない変更", systemImage: "lock.doc")
                                     .font(.headline)
-                                Text("暗号化ファイルまたは除外パスのため、内容を非表示にしています。競合した場合は手動で解決してください。")
+                                Text("暗号化ファイルまたは除外パスのため、内容を非表示にしています。通常ファイルの競合時は、ローカルかリモートの版を選択できます。")
                                     .font(.callout).foregroundStyle(.secondary)
                                 Text(preview.omittedFiles.joined(separator: "\n"))
                             }

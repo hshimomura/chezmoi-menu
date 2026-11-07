@@ -36,6 +36,7 @@ final class AppModel {
     private(set) var lastSourceCommit: String?
     private(set) var checkReport: SyncCheckReport?
     private(set) var lastBackup: URL?
+    private(set) var conflictSelection: ConflictSelectionRequest?
     var notice = ""
     var section: SettingsSection = .overview
     var windowRequest = 0
@@ -46,6 +47,7 @@ final class AppModel {
     private var historyURL: URL { support.appendingPathComponent("history.json") }
     @ObservationIgnored private var operationTask: Task<String, Error>?
     @ObservationIgnored private var activeID: UUID?
+    @ObservationIgnored private var conflictContinuation: CheckedContinuation<[String: ConflictSide], Error>?
 
     init() {
         support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ChezmoiMenu")
@@ -98,6 +100,36 @@ final class AppModel {
         record("停止を要求しました。変更処理は完了を待ってから停止します。")
     }
 
+    func selectConflictVersions(_ choices: [String: ConflictSide], requestID: UUID) {
+        guard conflictSelection?.id == requestID else { return }
+        let continuation = conflictContinuation
+        conflictContinuation = nil
+        conflictSelection = nil
+        continuation?.resume(returning: choices)
+    }
+
+    private func requestConflictSelection(_ request: ConflictSelectionRequest) async throws -> [String: ConflictSide] {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                conflictContinuation = continuation
+                conflictSelection = request
+                phase = .choosing
+                status = "競合ファイルで採用する版を選択してください。"
+                show(.overview)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.conflictSelection?.id == request.id else { return }
+                let continuation = self.conflictContinuation
+                self.conflictContinuation = nil
+                self.conflictSelection = nil
+                continuation?.resume(throwing: CancellationError())
+            }
+        }
+    }
+
     private func begin(_ operation: AppOperation) throws -> Task<String, Error> {
         guard !running else { throw SyncError("別の操作を実行しています。完了を待ってください。") }
         let saved = (try? JSONDecoder().decode(SyncSettings.self, from: Data(contentsOf: settingsURL))) ?? settings
@@ -113,6 +145,9 @@ final class AppModel {
                 self.phase = event.phase; self.status = event.message
                 self.record(event.message)
             }
+        }, chooseConflicts: { [weak self] request in
+            guard let self else { throw CancellationError() }
+            return try await self.requestConflictSelection(request)
         })
         let task = Task<String, Error> { [self] in
             defer { running = false; stopping = false; activeID = nil; operationTask = nil }
@@ -123,7 +158,7 @@ final class AppModel {
                     let result = try await engine.sync(operation == .download ? .download : .upload)
                     lastBackup = result.backup
                     record("バックアップ: \(result.backup.lastPathComponent)")
-                    status = "\(operation == .download ? "Download" : "Upload") 完了 · AI 解決 \(result.resolvedCount) 件"
+                    status = "\(operation == .download ? "Download" : "Upload") 完了 · AI 解決 \(result.resolvedCount) 件 · 版の選択 \(result.selectedCount) 件"
                 case .check:
                     let result = try await engine.check()
                     checkReport = result

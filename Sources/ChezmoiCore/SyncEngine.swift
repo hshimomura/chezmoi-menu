@@ -16,6 +16,7 @@ public struct SyncSettings: Codable, Sendable {
 public struct SyncReport: Sendable {
     public let backup: URL
     public let resolvedCount: Int
+    public let selectedCount: Int
 }
 
 public struct SyncCheckReport: Sendable {
@@ -34,15 +35,18 @@ public actor SyncEngine {
     let resolver: (any ConflictResolving)?
     let logger: @Sendable (String) -> Void
     let onEvent: @Sendable (SyncEvent) -> Void
+    let chooseConflicts: ConflictSelecting?
     private var operationInProgress = false
     let command = Command()
     let fm = FileManager.default
 
     public init(settings: SyncSettings, backups: URL, resolver: (any ConflictResolving)?,
                 log: @escaping @Sendable (String) -> Void = { _ in },
-                onEvent: @escaping @Sendable (SyncEvent) -> Void = { _ in }) {
+                onEvent: @escaping @Sendable (SyncEvent) -> Void = { _ in },
+                chooseConflicts: ConflictSelecting? = nil) {
         self.settings = settings; self.backups = backups; self.resolver = resolver
         self.logger = log; self.onEvent = onEvent
+        self.chooseConflicts = chooseConflicts
     }
 
     private var flags: [String] {
@@ -74,7 +78,7 @@ public actor SyncEngine {
     @discardableResult
     private func git(_ args: [String], _ source: URL, allowFailure: Bool = false) async throws -> CommandResult {
         try Task.checkCancellation()
-        if ["add", "commit", "merge", "push"].contains(args.first ?? "") {
+        if ["add", "commit", "merge", "push", "restore", "rm"].contains(args.first ?? "") {
             return try await command.runToCompletion("/usr/bin/git", args, directory: source, allowFailure: allowFailure)
         }
         return try await command.run("/usr/bin/git", args, directory: source, allowFailure: allowFailure)
@@ -199,7 +203,7 @@ public actor SyncEngine {
         let localHead = try await git(["rev-parse", "HEAD"], source).text.trimmingCharacters(in: .whitespacesAndNewlines)
         try "\(localHead)\n".write(to: backup.appendingPathComponent("captured-head.txt"), atomically: true, encoding: .utf8)
         let resolved = try await integrate(source: source, fetched: fetched, localHead: localHead,
-                                           backup: backup, pendingApply: pendingApply)
+                                           backup: backup, pendingApply: pendingApply, direction: direction)
         let applyFlags = settings.runScripts ? [] : ["--exclude=scripts"]
         report(.validating, "適用内容を検証しています…")
         // Rendering catches broken chezmoi templates before touching destination files.
@@ -215,18 +219,19 @@ public actor SyncEngine {
             try await git(["push", "--", remote, "HEAD:\(remoteRef)"], source)
         }
         report(.finished, direction == .download ? "Download 同期が完了しました。" : "Upload 同期が完了しました。")
-        return SyncReport(backup: backup, resolvedCount: resolved)
+        return SyncReport(backup: backup, resolvedCount: resolved.ai, selectedCount: resolved.selected)
     }
 
     private func integrate(source: URL, fetched: String, localHead: String,
-                           backup: URL, pendingApply: URL) async throws -> Int {
+                           backup: URL, pendingApply: URL, direction: SyncDirection) async throws -> (ai: Int, selected: Int) {
         try Task.checkCancellation()
         // Record BEFORE merging: a stopped task must not re-import the old destination over a merge.
         try JSONSerialization.data(withJSONObject: ["backup": backup.path, "head": localHead])
             .write(to: pendingApply, options: .atomic)
         var completed = false
+        var cleanupAllowed = true
         defer {
-            if !completed {
+            if !completed && cleanupAllowed {
                 await withTaskCancellationShield {
                     report(.cleaningUp, "未完了の merge を後処理しています…")
                     if fm.fileExists(atPath: source.appendingPathComponent(".git/MERGE_HEAD").path) {
@@ -241,18 +246,94 @@ public actor SyncEngine {
             }
         }
         var resolved = 0
+        var selected = 0
         report(.merging, "ローカルとリモートを統合しています…")
         let merge = try await git(["merge", "--no-edit", "--no-stat", fetched], source, allowFailure: true)
         if merge.code != 0 {
             let paths = try await conflictPaths(source)
             guard !paths.isEmpty else { throw SyncError("Git merge が失敗しました。リポジトリの状態を確認してください。") }
-            guard settings.autoResolve, let resolver else {
-                throw SyncError("競合があります。設定で AI 自動解決を有効にして API key を保存してください。")
-            }
             // Validate ALL paths before sending any content.
             var conflicts: [Conflict] = []
-            for path in paths { conflicts.append(try await readConflict(path, source: source)) }
+            var selectable: [SelectableConflict] = []
+            for path in paths {
+                if isContentExcluded(path) || !settings.autoResolve || resolver == nil {
+                    guard chooseConflicts != nil else {
+                        if isContentExcluded(path) { throw SyncError("AI 送信の除外対象に競合があります。ローカルまたはリモートの版を選ぶか、手動で解決してください。") }
+                        throw SyncError("競合があります。採用する版を選ぶか、AI 自動解決を有効にして API key を保存してください。")
+                    }
+                    selectable.append(try await selectableConflict(path, source: source))
+                } else {
+                    do {
+                        conflicts.append(try await readConflict(path, source: source))
+                    } catch {
+                        guard chooseConflicts != nil else { throw error }
+                        selectable.append(try await selectableConflict(path, source: source))
+                    }
+                }
+            }
+            if !selectable.isEmpty, let chooseConflicts {
+                let indexBefore = try await git(["ls-files", "--stage", "-z"], source).data
+                var snapshots: [String: ConflictFileSnapshot] = [:]
+                for path in paths { snapshots[path] = try conflictSnapshot(source.appendingPathComponent(path)) }
+                report(.choosing, "自動統合できない競合があります。採用する版を選択してください。")
+                var choices: [String: ConflictSide] = [:]
+                var selectionError: (any Error)?
+                do {
+                    choices = try await chooseConflicts(ConflictSelectionRequest(conflicts: selectable,
+                        localHead: localHead, remoteHead: fetched, direction: direction))
+                } catch { selectionError = error }
+                // Check even when the chooser was cancelled: merge --abort must not undo external Git work.
+                try await withTaskCancellationShield {
+                    let currentHead = try await git(["rev-parse", "HEAD"], source).text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let mergeHead = try await git(["rev-parse", "--verify", "MERGE_HEAD"], source, allowFailure: true).text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let indexAfter = try await git(["ls-files", "--stage", "-z"], source).data
+                    guard currentHead == localHead, mergeHead == fetched, indexBefore == indexAfter else {
+                        cleanupAllowed = false
+                        throw SyncError("版の選択中に Git の状態が変更されました。変更を保護するため後処理を止めました。リポジトリとバックアップを確認してください。")
+                    }
+                    var edited = false
+                    var deleted: [String] = []
+                    for path in paths {
+                        let file = source.appendingPathComponent(path)
+                        guard file.resolvingSymlinksInPath().path.hasPrefix(source.path + "/") else {
+                            cleanupAllowed = false
+                            throw SyncError("版の選択中に source のパスが変更されました。リポジトリとバックアップを確認してください。")
+                        }
+                        if (try? conflictSnapshot(file)) != snapshots[path] {
+                            edited = true
+                            // If any backup fails, preserve the live merge instead of discarding edits.
+                            cleanupAllowed = false
+                            let saved = backup.appendingPathComponent("external-source-edits").appendingPathComponent(path)
+                            try fm.createDirectory(at: saved.deletingLastPathComponent(), withIntermediateDirectories: true)
+                            if fm.fileExists(atPath: file.path) { try fm.copyItem(at: file, to: saved) }
+                            else { deleted.append(path) }
+                        }
+                    }
+                    if !deleted.isEmpty {
+                        try JSONEncoder().encode(deleted).write(to: backup.appendingPathComponent("external-source-deletions.json"))
+                    }
+                    if edited {
+                        cleanupAllowed = true
+                        throw SyncError("版の選択中に source が編集されたため停止しました。編集内容・削除の記録はバックアップに保存しました。")
+                    }
+                }
+                if let selectionError { throw selectionError }
+                try Task.checkCancellation()
+                guard Set(choices.keys) == Set(selectable.map(\.path)) else { throw SyncError("すべての競合ファイルで採用する版を選択してください。") }
+                report(.merging, "選択した版で競合を解決しています…")
+                for item in selectable {
+                    let useLocal = choices[item.path] == .local
+                    if useLocal ? item.localDeleted : item.remoteDeleted {
+                        try await git(["rm", "--force", "--", ":(literal)" + item.path], source)
+                    } else {
+                        let revision = useLocal ? localHead : fetched
+                        try await git(["restore", "--source=" + revision, "--staged", "--worktree", "--", ":(literal)" + item.path], source)
+                    }
+                    selected += 1
+                }
+            }
             for conflict in conflicts {
+                guard let resolver else { throw SyncError("AI 競合解決を利用できません。") }
                 report(.resolving, "AI で競合を解決しています（\(resolved + 1)/\(conflicts.count)）…")
                 let file = source.appendingPathComponent(conflict.path)
                 let beforeAI = try Data(contentsOf: file)
@@ -271,11 +352,38 @@ public actor SyncEngine {
                 resolved += 1
             }
             guard try await conflictPaths(source).isEmpty else { throw SyncError("未解決の競合が残っています。") }
-            try await git(["commit", "-m", "Chezmoi Menu: merge upstream with AI conflict resolution"], source)
+            try await git(["commit", "-m", "Chezmoi Menu: merge upstream with conflict resolution"], source)
         }
         // No suspension after the last protected mutation: leave the marker until apply finishes.
         completed = true
-        return resolved
+        return (resolved, selected)
+    }
+
+    private struct ConflictFileSnapshot: Equatable {
+        let data: Data?
+        let permissions: Int?
+    }
+
+    private func conflictSnapshot(_ file: URL) throws -> ConflictFileSnapshot {
+        guard let attrs = try? fm.attributesOfItem(atPath: file.path) else { return ConflictFileSnapshot(data: nil, permissions: nil) }
+        guard attrs[.type] as? FileAttributeType == .typeRegular else { throw SyncError("版の選択は通常ファイルの競合に対応しています。リンク・特殊ファイルは手動で解決してください。") }
+        return try ConflictFileSnapshot(data: Data(contentsOf: file), permissions: attrs[.posixPermissions] as? Int)
+    }
+
+    private func selectableConflict(_ path: String, source: URL) async throws -> SelectableConflict {
+        guard !path.hasPrefix("/"), !path.split(separator: "/").contains("..") else { throw SyncError("競合のパスを確認できません。") }
+        let entries = try await git(["ls-files", "--stage", "-z", "--", ":(literal)" + path], source).text.split(separator: "\0")
+        var stages: Set<Int> = []
+        for entry in entries {
+            let fields = entry.prefix { $0 != "\t" }.split(separator: " ")
+            guard fields.count == 3, ["100644", "100755"].contains(String(fields[0])),
+                  let stage = Int(fields[2]), (1...3).contains(stage) else {
+                throw SyncError("リンク・特殊ファイル・ディレクトリの競合は手動で解決してください。")
+            }
+            stages.insert(stage)
+        }
+        guard stages.contains(2) || stages.contains(3) else { throw SyncError("競合する版を確認できません。") }
+        return SelectableConflict(path: path, localDeleted: !stages.contains(2), remoteDeleted: !stages.contains(3))
     }
 
     // Local-only preview. The same exclusion policy protects AI input and on-screen diff content.

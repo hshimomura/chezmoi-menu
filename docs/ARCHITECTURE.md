@@ -20,9 +20,11 @@ UI は `@MainActor @Observable` な共有モデルを参照します。メニュ
 
 Git / chezmoi は Swift Subprocess の非同期パイプで実行します。UI スレッドでの polling / sleep は使用しません。標準出力・標準エラーの取得量を制限し、履歴には生出力を載せません。同期テストの環境構築だけは従来の同期型ヘルパーを使用します。
 
+自動統合できない通常ファイルの競合は、内容を含まない `ConflictSelectionRequest` を UI へ渡して採用版の回答を待ちます。UI は continuation を選択またはキャンセルで一度だけ完了させます。選択前後の HEAD・MERGE_HEAD・index・競合ファイルの内容と権限を確認し、選択した固定コミットから対象ファイルだけを復元します。削除版は Git index と source から削除し、ホーム側の管理解除は chezmoi の動作に従います。AI 解決とは別に件数を記録します。
+
 ## 停止の境界
 
-Swift 6.4 の `withTaskCancellationShield` を使用し、re-add・add・commit・merge・apply・push がユーザー操作で途中終了しないようにします。Subprocess 内の子タスクへのキャンセル伝播を分離するため、変更コマンドは所有する独立タスクを生成し、その完了を必ず await します。読み取り、fetch、AI 待機はキャンセル可能です。子プロセスは独立したセッションに配置し、中断時はプロセスグループへシグナルを送ります。通常のコマンドには 120 秒のタイムアウトを別途設けます。
+Swift 6.4 の `withTaskCancellationShield` を使用し、re-add・add・restore・rm・commit・merge・apply・push がユーザー操作で途中終了しないようにします。Subprocess 内の子タスクへのキャンセル伝播を分離するため、変更コマンドは所有する独立タスクを生成し、その完了を必ず await します。読み取り、fetch、AI 待機はキャンセル可能です。子プロセスは独立したセッションに配置し、中断時はプロセスグループへシグナルを送ります。通常のコマンドには 120 秒のタイムアウトを別途設けます。
 
 非同期 `defer` と cancellation shield により、キャンセル後も merge の中止処理を待ちます。取り込み済みコミットを残し、統合が完了していなければ未適用記録の解除を試みます。merge 開始前から未適用記録を保存するため、統合直後に停止しても次回の re-add が統合結果を置き換えません。apply 成功後に記録を削除します。
 

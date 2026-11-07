@@ -66,7 +66,7 @@ public struct Command: Sendable {
                     let value = CommandResult(code: code, data: result.standardOutput,
                                               error: String(decoding: result.standardError, as: UTF8.self))
                     if code != 0 && !allowFailure {
-                        let known = ["fetch", "merge", "commit", "push", "apply", "status", "diff", "re-add"]
+                        let known = ["fetch", "merge", "commit", "push", "apply", "status", "diff", "re-add", "restore", "rm"]
                         let operation = arguments.first.flatMap { known.contains($0) ? $0 : nil } ?? "command"
                         throw SyncError("\(operation) が失敗しました（終了コード \(code)）。認証・設定とリポジトリの状態を確認してください。")
                     }

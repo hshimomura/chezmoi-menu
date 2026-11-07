@@ -14,7 +14,7 @@ macOS 27 以降の Apple Silicon Mac で利用できます。arm64 専用で、�
 ダウンロードの整合性を確認したい場合は、同じ Release の `.sha256` ファイルも ZIP と同じフォルダへ保存し、そのフォルダで実行します。
 
 ```sh
-shasum -a 256 -c Chezmoi-Menu-0.3.0-arm64.zip.sha256
+shasum -a 256 -c Chezmoi-Menu-0.4.0-arm64.zip.sha256
 ```
 
 別バージョンではファイル名を読み替えます。
